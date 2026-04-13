@@ -9,8 +9,8 @@ from collections import defaultdict, OrderedDict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import uvicorn
-import whisper
 import deepl
+from faster_whisper import WhisperModel
 
 app = FastAPI(title="Live Translate Backend")
 
@@ -18,7 +18,18 @@ DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
-model = whisper.load_model("small")
+
+# Model boyutu:
+# base  = daha hızlı, biraz daha düşük doğruluk
+# small = daha iyi doğruluk, yine iyi hız
+# İlk önerim: small
+MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
+
+model = WhisperModel(
+    MODEL_SIZE,
+    device="cpu",
+    compute_type="int8",
+)
 
 # room -> set[WebSocket]
 signal_rooms: dict[str, set[WebSocket]] = defaultdict(set)
@@ -82,7 +93,7 @@ def get_cached_translation(cache_key: str):
 
 def set_cached_translation(cache_key: str, translated_text: str):
     if cache_key in translation_cache:
-        translation_cache.pop(cache_key, None)
+        translation_cache.pop(key, None)
 
     translation_cache[cache_key] = {
         "result": translated_text,
@@ -93,14 +104,32 @@ def set_cached_translation(cache_key: str, translated_text: str):
         translation_cache.popitem(last=False)
 
 
+def transcribe_audio_file(audio_path: str) -> str:
+    segments, _ = model.transcribe(
+        audio_path,
+        beam_size=1,
+        vad_filter=True,
+        language=None,
+    )
+
+    text_parts = []
+    for segment in segments:
+        if segment.text:
+            text_parts.append(segment.text.strip())
+
+    return " ".join(text_parts).strip()
+
+
 @app.get("/")
 async def root():
     return JSONResponse(
         {
             "ok": True,
             "service": "live-translate-backend",
-            "routes": ["/signal", "/translate"],
+            "routes": ["/signal", "/translate", "/health", "/cache/stats"],
             "cache_enabled": True,
+            "stt_engine": "faster-whisper",
+            "model_size": MODEL_SIZE,
         }
     )
 
@@ -207,8 +236,7 @@ async def translate_socket(websocket: WebSocket):
                     f.write(audio_bytes)
                     temp_path = f.name
 
-                result = model.transcribe(temp_path, fp16=False)
-                text = result["text"].strip()
+                text = transcribe_audio_file(temp_path)
 
                 if temp_path and os.path.exists(temp_path):
                     try:
