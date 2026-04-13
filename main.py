@@ -2,7 +2,9 @@ import os
 import json
 import base64
 import tempfile
-from collections import defaultdict
+import time
+import re
+from collections import defaultdict, OrderedDict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -20,6 +22,13 @@ model = whisper.load_model("small")
 
 # room -> set[WebSocket]
 signal_rooms: dict[str, set[WebSocket]] = defaultdict(set)
+
+# -------------------------
+# CACHE AYARLARI
+# -------------------------
+MAX_CACHE_ITEMS = 1000
+CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 saat
+translation_cache = OrderedDict()
 
 
 def normalize_source_lang(lang: str) -> str:
@@ -40,6 +49,50 @@ def normalize_target_lang(lang: str) -> str:
     return lang
 
 
+def normalize_text(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[.!?,:;]+$", "", text)
+    return text
+
+
+def make_cache_key(text: str, source_lang: str, target_lang: str) -> str:
+    normalized_text = normalize_text(text)
+    return f"{source_lang}__{target_lang}__{normalized_text}"
+
+
+def cleanup_expired_cache():
+    now = time.time()
+    expired_keys = []
+
+    for key, value in translation_cache.items():
+        if now - value["created_at"] > CACHE_TTL_SECONDS:
+            expired_keys.append(key)
+
+    for key in expired_keys:
+        translation_cache.pop(key, None)
+
+
+def get_cached_translation(cache_key: str):
+    if cache_key in translation_cache:
+        translation_cache.move_to_end(cache_key)
+        return translation_cache[cache_key]["result"]
+    return None
+
+
+def set_cached_translation(cache_key: str, translated_text: str):
+    if cache_key in translation_cache:
+        translation_cache.pop(cache_key, None)
+
+    translation_cache[cache_key] = {
+        "result": translated_text,
+        "created_at": time.time()
+    }
+
+    while len(translation_cache) > MAX_CACHE_ITEMS:
+        translation_cache.popitem(last=False)
+
+
 @app.get("/")
 async def root():
     return JSONResponse(
@@ -47,8 +100,24 @@ async def root():
             "ok": True,
             "service": "live-translate-backend",
             "routes": ["/signal", "/translate"],
+            "cache_enabled": True,
         }
     )
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "status": "healthy"}
+
+
+@app.get("/cache/stats")
+async def cache_stats():
+    cleanup_expired_cache()
+    return {
+        "cache_items": len(translation_cache),
+        "max_cache_items": MAX_CACHE_ITEMS,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+    }
 
 
 @app.websocket("/signal")
@@ -72,16 +141,17 @@ async def signal_socket(websocket: WebSocket):
                 signal_rooms[room].add(websocket)
                 joined_room = room
 
-                # odaya bilgi ver
                 for client in list(signal_rooms[room]):
                     if client != websocket:
-                        await client.send_text(json.dumps({
-                            "type": "join",
-                            "room": room,
-                        }))
+                        try:
+                            await client.send_text(json.dumps({
+                                "type": "join",
+                                "room": room,
+                            }))
+                        except Exception:
+                            pass
                 continue
 
-            # diğer tüm signaling mesajlarını odadaki diğer kullanıcılara ilet
             for client in list(signal_rooms[room]):
                 if client != websocket:
                     try:
@@ -128,6 +198,8 @@ async def translate_socket(websocket: WebSocket):
                 }))
                 continue
 
+            temp_path = None
+
             try:
                 audio_bytes = base64.b64decode(audio_b64)
 
@@ -138,14 +210,30 @@ async def translate_socket(websocket: WebSocket):
                 result = model.transcribe(temp_path, fp16=False)
                 text = result["text"].strip()
 
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+                    temp_path = None
 
                 if not text:
                     await websocket.send_text(json.dumps({
                         "error": "ses algılanamadı"
+                    }))
+                    continue
+
+                cleanup_expired_cache()
+                cache_key = make_cache_key(text, source_lang, target_lang)
+                cached_translation = get_cached_translation(cache_key)
+
+                if cached_translation is not None:
+                    await websocket.send_text(json.dumps({
+                        "original": text,
+                        "translated": cached_translation,
+                        "sourceLang": source_lang,
+                        "targetLang": target_lang,
+                        "cached": True
                     }))
                     continue
 
@@ -155,14 +243,23 @@ async def translate_socket(websocket: WebSocket):
                     target_lang=target_lang,
                 ).text
 
+                set_cached_translation(cache_key, translated)
+
                 await websocket.send_text(json.dumps({
                     "original": text,
                     "translated": translated,
                     "sourceLang": source_lang,
                     "targetLang": target_lang,
+                    "cached": False
                 }))
 
             except Exception as e:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+
                 await websocket.send_text(json.dumps({
                     "error": str(e)
                 }))
@@ -172,11 +269,4 @@ async def translate_socket(websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
-    from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.get("/")
-def home():
-    return {"message": "API çalışıyor"}
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
