@@ -7,8 +7,8 @@ from uuid import uuid4
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import uvicorn
-import whisper
 import deepl
+from faster_whisper import WhisperModel
 
 app = FastAPI(title="Live Translate Backend")
 
@@ -16,19 +16,11 @@ DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
-model = whisper.load_model("small")
 
-# websocket -> {"clientId": str, "room": str|None}
+# whisper yerine faster-whisper
+model = WhisperModel("small", device="cpu", compute_type="int8")
+
 client_info = {}
-
-# room_id -> {
-#   "owner": WebSocket,
-#   "ownerId": str,
-#   "members": set[WebSocket],
-#   "pending": {clientId: WebSocket},
-#   "capacity": int,
-#   "privateCode": str
-# }
 signal_rooms = {}
 
 
@@ -89,7 +81,6 @@ async def signal_socket(websocket: WebSocket):
             data = json.loads(raw)
             msg_type = data.get("type")
 
-            # 1) ODA OLUŞTUR
             if msg_type == "create_room":
                 room_id = data.get("room")
                 capacity = int(data.get("capacity", 2))
@@ -125,7 +116,6 @@ async def signal_socket(websocket: WebSocket):
                 }))
                 continue
 
-            # 2) ODAYA GİRİŞ İSTEĞİ
             if msg_type == "request_join":
                 room_id = data.get("room")
                 private_code = data.get("privateCode")
@@ -162,7 +152,6 @@ async def signal_socket(websocket: WebSocket):
                 }))
                 continue
 
-            # 3) OWNER KARARI
             if msg_type == "join_decision":
                 room_id = data.get("room")
                 requester_id = data.get("requesterId")
@@ -210,7 +199,6 @@ async def signal_socket(websocket: WebSocket):
                     }))
                 continue
 
-            # 4) ODADAN ÇIKIŞ
             if msg_type == "leave_room":
                 room_id = client_info.get(websocket, {}).get("room")
                 cid = client_info.get(websocket, {}).get("clientId")
@@ -221,7 +209,6 @@ async def signal_socket(websocket: WebSocket):
                     if websocket in room["members"]:
                         room["members"].remove(websocket)
 
-                    # Owner çıktıysa oda kapanır
                     if websocket == room["owner"]:
                         for member in list(room["members"]):
                             await member.send_text(json.dumps({
@@ -246,7 +233,6 @@ async def signal_socket(websocket: WebSocket):
                 }))
                 continue
 
-            # 5) NORMAL WEBRTC MESAJLARI
             if msg_type in ["offer", "answer", "candidate"]:
                 room_id = data.get("room")
                 if room_id not in signal_rooms:
@@ -334,8 +320,8 @@ async def translate_socket(websocket: WebSocket):
                     f.write(audio_bytes)
                     temp_path = f.name
 
-                result = model.transcribe(temp_path, fp16=False)
-                text = result["text"].strip()
+                segments, _ = model.transcribe(temp_path, beam_size=1)
+                text = " ".join(segment.text for segment in segments).strip()
 
                 try:
                     os.remove(temp_path)
