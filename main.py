@@ -2,15 +2,13 @@ import os
 import json
 import base64
 import tempfile
-import time
-import re
-from collections import defaultdict, OrderedDict
+from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import uvicorn
+import whisper
 import deepl
-from faster_whisper import WhisperModel
 
 app = FastAPI(title="Live Translate Backend")
 
@@ -18,28 +16,20 @@ DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
+model = whisper.load_model("small")
 
-# Model boyutu:
-# base  = daha hızlı, biraz daha düşük doğruluk
-# small = daha iyi doğruluk, yine iyi hız
-# İlk önerim: small
-MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
+# websocket -> {"clientId": str, "room": str|None}
+client_info = {}
 
-model = WhisperModel(
-    MODEL_SIZE,
-    device="cpu",
-    compute_type="int8",
-)
-
-# room -> set[WebSocket]
-signal_rooms: dict[str, set[WebSocket]] = defaultdict(set)
-
-# -------------------------
-# CACHE AYARLARI
-# -------------------------
-MAX_CACHE_ITEMS = 1000
-CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 saat
-translation_cache = OrderedDict()
+# room_id -> {
+#   "owner": WebSocket,
+#   "ownerId": str,
+#   "members": set[WebSocket],
+#   "pending": {clientId: WebSocket},
+#   "capacity": int,
+#   "privateCode": str
+# }
+signal_rooms = {}
 
 
 def normalize_source_lang(lang: str) -> str:
@@ -60,64 +50,15 @@ def normalize_target_lang(lang: str) -> str:
     return lang
 
 
-def normalize_text(text: str) -> str:
-    text = text.strip().lower()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[.!?,:;]+$", "", text)
-    return text
-
-
-def make_cache_key(text: str, source_lang: str, target_lang: str) -> str:
-    normalized_text = normalize_text(text)
-    return f"{source_lang}__{target_lang}__{normalized_text}"
-
-
-def cleanup_expired_cache():
-    now = time.time()
-    expired_keys = []
-
-    for key, value in translation_cache.items():
-        if now - value["created_at"] > CACHE_TTL_SECONDS:
-            expired_keys.append(key)
-
-    for key in expired_keys:
-        translation_cache.pop(key, None)
-
-
-def get_cached_translation(cache_key: str):
-    if cache_key in translation_cache:
-        translation_cache.move_to_end(cache_key)
-        return translation_cache[cache_key]["result"]
-    return None
-
-
-def set_cached_translation(cache_key: str, translated_text: str):
-    if cache_key in translation_cache:
-        translation_cache.pop(key, None)
-
-    translation_cache[cache_key] = {
-        "result": translated_text,
-        "created_at": time.time()
+def room_payload(room_id: str):
+    room = signal_rooms[room_id]
+    return {
+        "room": room_id,
+        "ownerId": room["ownerId"],
+        "capacity": room["capacity"],
+        "memberCount": len(room["members"]),
+        "privateCode": room["privateCode"],
     }
-
-    while len(translation_cache) > MAX_CACHE_ITEMS:
-        translation_cache.popitem(last=False)
-
-
-def transcribe_audio_file(audio_path: str) -> str:
-    segments, _ = model.transcribe(
-        audio_path,
-        beam_size=1,
-        vad_filter=True,
-        language=None,
-    )
-
-    text_parts = []
-    for segment in segments:
-        if segment.text:
-            text_parts.append(segment.text.strip())
-
-    return " ".join(text_parts).strip()
 
 
 @app.get("/")
@@ -126,75 +67,234 @@ async def root():
         {
             "ok": True,
             "service": "live-translate-backend",
-            "routes": ["/signal", "/translate", "/health", "/cache/stats"],
-            "cache_enabled": True,
-            "stt_engine": "faster-whisper",
-            "model_size": MODEL_SIZE,
+            "routes": ["/signal", "/translate"],
         }
     )
-
-
-@app.get("/health")
-async def health():
-    return {"ok": True, "status": "healthy"}
-
-
-@app.get("/cache/stats")
-async def cache_stats():
-    cleanup_expired_cache()
-    return {
-        "cache_items": len(translation_cache),
-        "max_cache_items": MAX_CACHE_ITEMS,
-        "cache_ttl_seconds": CACHE_TTL_SECONDS,
-    }
 
 
 @app.websocket("/signal")
 async def signal_socket(websocket: WebSocket):
     await websocket.accept()
-    joined_room = None
+    client_id = str(uuid4())
+    client_info[websocket] = {"clientId": client_id, "room": None}
 
     try:
+        await websocket.send_text(json.dumps({
+            "type": "welcome",
+            "clientId": client_id
+        }))
+
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
-
             msg_type = data.get("type")
-            room = data.get("room")
 
-            if not room:
-                await websocket.send_text(json.dumps({"error": "room gerekli"}))
+            # 1) ODA OLUŞTUR
+            if msg_type == "create_room":
+                room_id = data.get("room")
+                capacity = int(data.get("capacity", 2))
+                private_code = data.get("privateCode")
+
+                if not room_id or not private_code:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "room ve privateCode gerekli"
+                    }))
+                    continue
+
+                if room_id in signal_rooms:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Bu oda zaten var"
+                    }))
+                    continue
+
+                signal_rooms[room_id] = {
+                    "owner": websocket,
+                    "ownerId": client_id,
+                    "members": {websocket},
+                    "pending": {},
+                    "capacity": capacity,
+                    "privateCode": private_code,
+                }
+                client_info[websocket]["room"] = room_id
+
+                await websocket.send_text(json.dumps({
+                    "type": "room_created",
+                    **room_payload(room_id)
+                }))
                 continue
 
-            if msg_type == "join":
-                signal_rooms[room].add(websocket)
-                joined_room = room
+            # 2) ODAYA GİRİŞ İSTEĞİ
+            if msg_type == "request_join":
+                room_id = data.get("room")
+                private_code = data.get("privateCode")
 
-                for client in list(signal_rooms[room]):
-                    if client != websocket:
-                        try:
-                            await client.send_text(json.dumps({
-                                "type": "join",
-                                "room": room,
+                if room_id not in signal_rooms:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Oda bulunamadı"
+                    }))
+                    continue
+
+                room = signal_rooms[room_id]
+
+                if room["privateCode"] != private_code:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Oda kodu yanlış"
+                    }))
+                    continue
+
+                if len(room["members"]) >= room["capacity"]:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Oda dolu"
+                    }))
+                    continue
+
+                room["pending"][client_id] = websocket
+
+                await room["owner"].send_text(json.dumps({
+                    "type": "join_request",
+                    "room": room_id,
+                    "requesterId": client_id
+                }))
+                continue
+
+            # 3) OWNER KARARI
+            if msg_type == "join_decision":
+                room_id = data.get("room")
+                requester_id = data.get("requesterId")
+                accept = data.get("accept", False)
+
+                if room_id not in signal_rooms:
+                    continue
+
+                room = signal_rooms[room_id]
+
+                if websocket != room["owner"]:
+                    continue
+
+                requester_ws = room["pending"].pop(requester_id, None)
+                if requester_ws is None:
+                    continue
+
+                if accept:
+                    if len(room["members"]) >= room["capacity"]:
+                        await requester_ws.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Oda doldu"
+                        }))
+                        continue
+
+                    room["members"].add(requester_ws)
+                    client_info[requester_ws]["room"] = room_id
+
+                    await requester_ws.send_text(json.dumps({
+                        "type": "join_accepted",
+                        **room_payload(room_id)
+                    }))
+
+                    for member in list(room["members"]):
+                        if member != requester_ws:
+                            await member.send_text(json.dumps({
+                                "type": "member_joined",
+                                "room": room_id,
+                                "clientId": requester_id
                             }))
+                else:
+                    await requester_ws.send_text(json.dumps({
+                        "type": "join_rejected",
+                        "room": room_id
+                    }))
+                continue
+
+            # 4) ODADAN ÇIKIŞ
+            if msg_type == "leave_room":
+                room_id = client_info.get(websocket, {}).get("room")
+                cid = client_info.get(websocket, {}).get("clientId")
+
+                if room_id and room_id in signal_rooms:
+                    room = signal_rooms[room_id]
+
+                    if websocket in room["members"]:
+                        room["members"].remove(websocket)
+
+                    # Owner çıktıysa oda kapanır
+                    if websocket == room["owner"]:
+                        for member in list(room["members"]):
+                            await member.send_text(json.dumps({
+                                "type": "room_closed",
+                                "room": room_id
+                            }))
+                            client_info[member]["room"] = None
+
+                        del signal_rooms[room_id]
+                    else:
+                        for member in list(room["members"]):
+                            await member.send_text(json.dumps({
+                                "type": "member_left",
+                                "room": room_id,
+                                "clientId": cid
+                            }))
+
+                    client_info[websocket]["room"] = None
+
+                await websocket.send_text(json.dumps({
+                    "type": "left_room"
+                }))
+                continue
+
+            # 5) NORMAL WEBRTC MESAJLARI
+            if msg_type in ["offer", "answer", "candidate"]:
+                room_id = data.get("room")
+                if room_id not in signal_rooms:
+                    continue
+
+                room = signal_rooms[room_id]
+                for member in list(room["members"]):
+                    if member != websocket:
+                        try:
+                            await member.send_text(raw)
                         except Exception:
                             pass
                 continue
 
-            for client in list(signal_rooms[room]):
-                if client != websocket:
+    except WebSocketDisconnect:
+        room_id = client_info.get(websocket, {}).get("room")
+        cid = client_info.get(websocket, {}).get("clientId")
+
+        if room_id and room_id in signal_rooms:
+            room = signal_rooms[room_id]
+
+            if websocket in room["members"]:
+                room["members"].remove(websocket)
+
+            if websocket == room["owner"]:
+                for member in list(room["members"]):
                     try:
-                        await client.send_text(raw)
+                        await member.send_text(json.dumps({
+                            "type": "room_closed",
+                            "room": room_id
+                        }))
+                    except Exception:
+                        pass
+                    client_info[member]["room"] = None
+
+                del signal_rooms[room_id]
+            else:
+                for member in list(room["members"]):
+                    try:
+                        await member.send_text(json.dumps({
+                            "type": "member_left",
+                            "room": room_id,
+                            "clientId": cid
+                        }))
                     except Exception:
                         pass
 
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if joined_room and websocket in signal_rooms[joined_room]:
-            signal_rooms[joined_room].remove(websocket)
-            if not signal_rooms[joined_room]:
-                del signal_rooms[joined_room]
+        client_info.pop(websocket, None)
 
 
 @app.websocket("/translate")
@@ -227,8 +327,6 @@ async def translate_socket(websocket: WebSocket):
                 }))
                 continue
 
-            temp_path = None
-
             try:
                 audio_bytes = base64.b64decode(audio_b64)
 
@@ -236,32 +334,17 @@ async def translate_socket(websocket: WebSocket):
                     f.write(audio_bytes)
                     temp_path = f.name
 
-                text = transcribe_audio_file(temp_path)
+                result = model.transcribe(temp_path, fp16=False)
+                text = result["text"].strip()
 
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
-                    temp_path = None
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
                 if not text:
                     await websocket.send_text(json.dumps({
                         "error": "ses algılanamadı"
-                    }))
-                    continue
-
-                cleanup_expired_cache()
-                cache_key = make_cache_key(text, source_lang, target_lang)
-                cached_translation = get_cached_translation(cache_key)
-
-                if cached_translation is not None:
-                    await websocket.send_text(json.dumps({
-                        "original": text,
-                        "translated": cached_translation,
-                        "sourceLang": source_lang,
-                        "targetLang": target_lang,
-                        "cached": True
                     }))
                     continue
 
@@ -271,23 +354,14 @@ async def translate_socket(websocket: WebSocket):
                     target_lang=target_lang,
                 ).text
 
-                set_cached_translation(cache_key, translated)
-
                 await websocket.send_text(json.dumps({
                     "original": text,
                     "translated": translated,
                     "sourceLang": source_lang,
                     "targetLang": target_lang,
-                    "cached": False
                 }))
 
             except Exception as e:
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
-
                 await websocket.send_text(json.dumps({
                     "error": str(e)
                 }))
@@ -297,4 +371,4 @@ async def translate_socket(websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
