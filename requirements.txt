@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
-faster-whisper
-deepl
 python-multipart
+deepl
+deep-translator
+faster-whisper

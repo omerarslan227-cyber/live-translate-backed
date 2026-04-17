@@ -8,23 +8,24 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import uvicorn
 import deepl
+from deep_translator import GoogleTranslator
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="Live Translate Backend")
+app = FastAPI(title="BridgeCall Backend")
 
 DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
+fallback_translator = GoogleTranslator
 
-# whisper yerine faster-whisper
 model = WhisperModel("small", device="cpu", compute_type="int8")
 
 client_info = {}
 signal_rooms = {}
 
 
-def normalize_source_lang(lang: str) -> str:
+def normalize_source_lang(lang: str):
     if not lang:
         return "TR"
     lang = lang.upper()
@@ -33,7 +34,7 @@ def normalize_source_lang(lang: str) -> str:
     return lang
 
 
-def normalize_target_lang(lang: str) -> str:
+def normalize_target_lang(lang: str):
     if not lang:
         return "RU"
     lang = lang.upper()
@@ -53,12 +54,44 @@ def room_payload(room_id: str):
     }
 
 
+def google_lang(lang: str) -> str:
+    lang = normalize_target_lang(lang)
+    mapping = {
+        "TR": "tr",
+        "RU": "ru",
+        "UK": "uk",
+        "EN-US": "en",
+        "EN": "en",
+    }
+    return mapping.get(lang, "en")
+
+
+def translate_text_value(text: str, source_lang: str, target_lang: str) -> str:
+    if not text.strip():
+        return ""
+
+    source_lang = normalize_source_lang(source_lang)
+    target_lang = normalize_target_lang(target_lang)
+
+    if translator is not None:
+        return translator.translate_text(
+            text,
+            source_lang=source_lang,
+            target_lang=target_lang,
+        ).text
+
+    return fallback_translator(
+        source=google_lang(source_lang),
+        target=google_lang(target_lang),
+    ).translate(text)
+
+
 @app.get("/")
 async def root():
     return JSONResponse(
         {
             "ok": True,
-            "service": "live-translate-backend",
+            "service": "bridgecall-backend",
             "routes": ["/signal", "/translate"],
         }
     )
@@ -71,10 +104,7 @@ async def signal_socket(websocket: WebSocket):
     client_info[websocket] = {"clientId": client_id, "room": None}
 
     try:
-        await websocket.send_text(json.dumps({
-            "type": "welcome",
-            "clientId": client_id
-        }))
+        await websocket.send_text(json.dumps({"type": "welcome", "clientId": client_id}))
 
         while True:
             raw = await websocket.receive_text()
@@ -228,9 +258,58 @@ async def signal_socket(websocket: WebSocket):
 
                     client_info[websocket]["room"] = None
 
-                await websocket.send_text(json.dumps({
-                    "type": "left_room"
-                }))
+                await websocket.send_text(json.dumps({"type": "left_room"}))
+                continue
+
+            if msg_type == "chat_message":
+                room_id = data.get("room")
+                if room_id not in signal_rooms:
+                    continue
+
+                room = signal_rooms[room_id]
+                text = (data.get("text") or "").strip()
+                source_lang = data.get("sourceLang", "TR")
+                target_lang = data.get("targetLang", "RU")
+                translated_text = ""
+
+                if text:
+                    try:
+                        translated_text = translate_text_value(text, source_lang, target_lang)
+                    except Exception as exc:
+                        translated_text = f"Çeviri hatası: {exc}"
+
+                payload = {
+                    "type": "chat_message",
+                    "room": room_id,
+                    "text": text,
+                    "translatedText": translated_text,
+                    "senderId": client_id,
+                }
+
+                for member in list(room["members"]):
+                    try:
+                        await member.send_text(json.dumps(payload))
+                    except Exception:
+                        pass
+                continue
+
+            if msg_type == "reaction":
+                room_id = data.get("room")
+                if room_id not in signal_rooms:
+                    continue
+                room = signal_rooms[room_id]
+                payload = {
+                    "type": "reaction",
+                    "room": room_id,
+                    "emoji": data.get("emoji"),
+                    "senderId": client_id,
+                }
+                for member in list(room["members"]):
+                    if member != websocket:
+                        try:
+                            await member.send_text(json.dumps(payload))
+                        except Exception:
+                            pass
                 continue
 
             if msg_type in ["offer", "answer", "candidate"]:
@@ -287,11 +366,6 @@ async def signal_socket(websocket: WebSocket):
 async def translate_socket(websocket: WebSocket):
     await websocket.accept()
 
-    if translator is None:
-        await websocket.send_text(json.dumps({
-            "error": "DEEPL_AUTH_KEY ayarlı değil"
-        }))
-
     try:
         while True:
             raw = await websocket.receive_text()
@@ -302,15 +376,7 @@ async def translate_socket(websocket: WebSocket):
             target_lang = normalize_target_lang(data.get("targetLang", "RU"))
 
             if not audio_b64:
-                await websocket.send_text(json.dumps({
-                    "error": "audio alanı boş"
-                }))
-                continue
-
-            if translator is None:
-                await websocket.send_text(json.dumps({
-                    "error": "DeepL bağlantısı hazır değil"
-                }))
+                await websocket.send_text(json.dumps({"error": "audio alanı boş"}))
                 continue
 
             try:
@@ -329,16 +395,10 @@ async def translate_socket(websocket: WebSocket):
                     pass
 
                 if not text:
-                    await websocket.send_text(json.dumps({
-                        "error": "ses algılanamadı"
-                    }))
+                    await websocket.send_text(json.dumps({"error": "ses algılanamadı"}))
                     continue
 
-                translated = translator.translate_text(
-                    text,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                ).text
+                translated = translate_text_value(text, source_lang, target_lang)
 
                 await websocket.send_text(json.dumps({
                     "original": text,
@@ -348,13 +408,11 @@ async def translate_socket(websocket: WebSocket):
                 }))
 
             except Exception as e:
-                await websocket.send_text(json.dumps({
-                    "error": str(e)
-                }))
+                await websocket.send_text(json.dumps({"error": str(e)}))
 
     except WebSocketDisconnect:
         pass
 
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
