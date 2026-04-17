@@ -16,8 +16,6 @@ DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
-
-# whisper yerine faster-whisper
 model = WhisperModel("small", device="cpu", compute_type="int8")
 
 client_info = {}
@@ -53,6 +51,23 @@ def room_payload(room_id: str):
     }
 
 
+async def safe_send(websocket: WebSocket, payload: dict):
+    try:
+        await websocket.send_text(json.dumps(payload))
+    except Exception:
+        pass
+
+
+def remove_socket_from_pending(websocket: WebSocket):
+    for room in signal_rooms.values():
+        pending_to_remove = []
+        for requester_id, pending_ws in room["pending"].items():
+            if pending_ws == websocket:
+                pending_to_remove.append(requester_id)
+        for requester_id in pending_to_remove:
+            room["pending"].pop(requester_id, None)
+
+
 @app.get("/")
 async def root():
     return JSONResponse(
@@ -71,10 +86,7 @@ async def signal_socket(websocket: WebSocket):
     client_info[websocket] = {"clientId": client_id, "room": None}
 
     try:
-        await websocket.send_text(json.dumps({
-            "type": "welcome",
-            "clientId": client_id
-        }))
+        await safe_send(websocket, {"type": "welcome", "clientId": client_id})
 
         while True:
             raw = await websocket.receive_text()
@@ -87,17 +99,11 @@ async def signal_socket(websocket: WebSocket):
                 private_code = data.get("privateCode")
 
                 if not room_id or not private_code:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "room ve privateCode gerekli"
-                    }))
+                    await safe_send(websocket, {"type": "error", "message": "room ve privateCode gerekli"})
                     continue
 
                 if room_id in signal_rooms:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Bu oda zaten var"
-                    }))
+                    await safe_send(websocket, {"type": "error", "message": "Bu oda zaten var"})
                     continue
 
                 signal_rooms[room_id] = {
@@ -110,10 +116,7 @@ async def signal_socket(websocket: WebSocket):
                 }
                 client_info[websocket]["room"] = room_id
 
-                await websocket.send_text(json.dumps({
-                    "type": "room_created",
-                    **room_payload(room_id)
-                }))
+                await safe_send(websocket, {"type": "room_created", **room_payload(room_id)})
                 continue
 
             if msg_type == "request_join":
@@ -121,35 +124,21 @@ async def signal_socket(websocket: WebSocket):
                 private_code = data.get("privateCode")
 
                 if room_id not in signal_rooms:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Oda bulunamadı"
-                    }))
+                    await safe_send(websocket, {"type": "error", "message": "Oda bulunamadı"})
                     continue
 
                 room = signal_rooms[room_id]
 
                 if room["privateCode"] != private_code:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Oda kodu yanlış"
-                    }))
+                    await safe_send(websocket, {"type": "error", "message": "Oda kodu yanlış"})
                     continue
 
                 if len(room["members"]) >= room["capacity"]:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Oda dolu"
-                    }))
+                    await safe_send(websocket, {"type": "error", "message": "Oda dolu"})
                     continue
 
                 room["pending"][client_id] = websocket
-
-                await room["owner"].send_text(json.dumps({
-                    "type": "join_request",
-                    "room": room_id,
-                    "requesterId": client_id
-                }))
+                await safe_send(room["owner"], {"type": "join_request", "room": room_id, "requesterId": client_id})
                 continue
 
             if msg_type == "join_decision":
@@ -161,7 +150,6 @@ async def signal_socket(websocket: WebSocket):
                     continue
 
                 room = signal_rooms[room_id]
-
                 if websocket != room["owner"]:
                     continue
 
@@ -171,69 +159,44 @@ async def signal_socket(websocket: WebSocket):
 
                 if accept:
                     if len(room["members"]) >= room["capacity"]:
-                        await requester_ws.send_text(json.dumps({
-                            "type": "error",
-                            "message": "Oda doldu"
-                        }))
+                        await safe_send(requester_ws, {"type": "error", "message": "Oda doldu"})
                         continue
 
                     room["members"].add(requester_ws)
                     client_info[requester_ws]["room"] = room_id
 
-                    await requester_ws.send_text(json.dumps({
-                        "type": "join_accepted",
-                        **room_payload(room_id)
-                    }))
-
+                    await safe_send(requester_ws, {"type": "join_accepted", **room_payload(room_id)})
                     for member in list(room["members"]):
                         if member != requester_ws:
-                            await member.send_text(json.dumps({
-                                "type": "member_joined",
-                                "room": room_id,
-                                "clientId": requester_id
-                            }))
+                            await safe_send(member, {"type": "member_joined", "room": room_id, "clientId": requester_id})
                 else:
-                    await requester_ws.send_text(json.dumps({
-                        "type": "join_rejected",
-                        "room": room_id
-                    }))
+                    await safe_send(requester_ws, {"type": "join_rejected", "room": room_id})
                 continue
 
-            if msg_type == "leave_room":
+            if msg_type in ["leave_room", "leave"]:
                 room_id = client_info.get(websocket, {}).get("room")
                 cid = client_info.get(websocket, {}).get("clientId")
 
                 if room_id and room_id in signal_rooms:
                     room = signal_rooms[room_id]
-
-                    if websocket in room["members"]:
-                        room["members"].remove(websocket)
+                    room["members"].discard(websocket)
+                    remove_socket_from_pending(websocket)
 
                     if websocket == room["owner"]:
                         for member in list(room["members"]):
-                            await member.send_text(json.dumps({
-                                "type": "room_closed",
-                                "room": room_id
-                            }))
+                            await safe_send(member, {"type": "room_closed", "room": room_id})
                             client_info[member]["room"] = None
-
                         del signal_rooms[room_id]
                     else:
                         for member in list(room["members"]):
-                            await member.send_text(json.dumps({
-                                "type": "member_left",
-                                "room": room_id,
-                                "clientId": cid
-                            }))
+                            await safe_send(member, {"type": "member_left", "room": room_id, "clientId": cid})
 
                     client_info[websocket]["room"] = None
 
-                await websocket.send_text(json.dumps({
-                    "type": "left_room"
-                }))
+                await safe_send(websocket, {"type": "left_room"})
                 continue
 
-            if msg_type in ["offer", "answer", "candidate"]:
+            if msg_type in ["offer", "answer", "candidate", "chat_message", "reaction"]:
                 room_id = data.get("room")
                 if room_id not in signal_rooms:
                     continue
@@ -241,44 +204,26 @@ async def signal_socket(websocket: WebSocket):
                 room = signal_rooms[room_id]
                 for member in list(room["members"]):
                     if member != websocket:
-                        try:
-                            await member.send_text(raw)
-                        except Exception:
-                            pass
+                        await safe_send(member, data)
                 continue
 
     except WebSocketDisconnect:
         room_id = client_info.get(websocket, {}).get("room")
         cid = client_info.get(websocket, {}).get("clientId")
+        remove_socket_from_pending(websocket)
 
         if room_id and room_id in signal_rooms:
             room = signal_rooms[room_id]
-
-            if websocket in room["members"]:
-                room["members"].remove(websocket)
+            room["members"].discard(websocket)
 
             if websocket == room["owner"]:
                 for member in list(room["members"]):
-                    try:
-                        await member.send_text(json.dumps({
-                            "type": "room_closed",
-                            "room": room_id
-                        }))
-                    except Exception:
-                        pass
+                    await safe_send(member, {"type": "room_closed", "room": room_id})
                     client_info[member]["room"] = None
-
                 del signal_rooms[room_id]
             else:
                 for member in list(room["members"]):
-                    try:
-                        await member.send_text(json.dumps({
-                            "type": "member_left",
-                            "room": room_id,
-                            "clientId": cid
-                        }))
-                    except Exception:
-                        pass
+                    await safe_send(member, {"type": "member_left", "room": room_id, "clientId": cid})
 
         client_info.pop(websocket, None)
 
@@ -288,34 +233,26 @@ async def translate_socket(websocket: WebSocket):
     await websocket.accept()
 
     if translator is None:
-        await websocket.send_text(json.dumps({
-            "error": "DEEPL_AUTH_KEY ayarlı değil"
-        }))
+        await safe_send(websocket, {"error": "DEEPL_AUTH_KEY ayarlı değil"})
 
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
-
             audio_b64 = data.get("audio")
             source_lang = normalize_source_lang(data.get("sourceLang", "TR"))
             target_lang = normalize_target_lang(data.get("targetLang", "RU"))
 
             if not audio_b64:
-                await websocket.send_text(json.dumps({
-                    "error": "audio alanı boş"
-                }))
+                await safe_send(websocket, {"error": "audio alanı boş"})
                 continue
 
             if translator is None:
-                await websocket.send_text(json.dumps({
-                    "error": "DeepL bağlantısı hazır değil"
-                }))
+                await safe_send(websocket, {"error": "DeepL bağlantısı hazır değil"})
                 continue
 
             try:
                 audio_bytes = base64.b64decode(audio_b64)
-
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
                     f.write(audio_bytes)
                     temp_path = f.name
@@ -329,9 +266,7 @@ async def translate_socket(websocket: WebSocket):
                     pass
 
                 if not text:
-                    await websocket.send_text(json.dumps({
-                        "error": "ses algılanamadı"
-                    }))
+                    await safe_send(websocket, {"error": "ses algılanamadı"})
                     continue
 
                 translated = translator.translate_text(
@@ -340,21 +275,21 @@ async def translate_socket(websocket: WebSocket):
                     target_lang=target_lang,
                 ).text
 
-                await websocket.send_text(json.dumps({
-                    "original": text,
-                    "translated": translated,
-                    "sourceLang": source_lang,
-                    "targetLang": target_lang,
-                }))
-
+                await safe_send(
+                    websocket,
+                    {
+                        "original": text,
+                        "translated": translated,
+                        "sourceLang": source_lang,
+                        "targetLang": target_lang,
+                    },
+                )
             except Exception as e:
-                await websocket.send_text(json.dumps({
-                    "error": str(e)
-                }))
+                await safe_send(websocket, {"error": str(e)})
 
     except WebSocketDisconnect:
         pass
 
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
