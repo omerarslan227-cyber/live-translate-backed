@@ -17,7 +17,7 @@ DEEPL_AUTH_KEY = (os.getenv("DEEPL_AUTH_KEY") or "").strip()
 PORT = int(os.getenv("PORT", "8000"))
 
 fallback_translator = GoogleTranslator
-model = WhisperModel("base", device="cpu", compute_type="int8")
+model = WhisperModel("tiny", device="cpu", compute_type="int8")
 
 
 def build_translator():
@@ -384,11 +384,16 @@ async def translate_socket(websocket: WebSocket):
                     f.write(audio_bytes)
                     temp_path = f.name
 
-                segments, _ = model.transcribe(temp_path, beam_size=1)
+                segments, _ = model.transcribe(
+                    temp_path,
+                    beam_size=1,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                )
                 text = " ".join(segment.text for segment in segments).strip()
 
                 if not text:
-                    await safe_send(websocket, {"error": "ses algılanamadı"})
+                    await safe_send(websocket, {"error": "Net ses algılanamadı, mikrofona biraz daha yakın konuş"})
                     continue
 
                 translated = translate_text_value(text, source_lang, target_lang)
@@ -403,7 +408,7 @@ async def translate_socket(websocket: WebSocket):
                     },
                 )
             except Exception as e:
-                await safe_send(websocket, {"error": user_safe_error_message(e)})
+                await safe_send(websocket, {"error": user_safe_error_message(e), "original": "", "translated": ""})
             finally:
                 if temp_path and os.path.exists(temp_path):
                     try:
