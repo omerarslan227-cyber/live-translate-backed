@@ -55,6 +55,8 @@ def normalize_source_lang(lang: str):
     lang = lang.upper()
     if lang == "EN-US":
         return "EN"
+    if lang in {"KA-GE", "GE"}:
+        return "KA"
     return lang
 
 
@@ -64,6 +66,8 @@ def normalize_target_lang(lang: str):
     lang = lang.upper()
     if lang == "EN":
         return "EN-US"
+    if lang in {"KA-GE", "GE"}:
+        return "KA"
     return lang
 
 
@@ -86,6 +90,7 @@ def google_lang(lang: str) -> str:
         "UK": "uk",
         "EN-US": "en",
         "EN": "en",
+        "KA": "ka",
     }
     return mapping.get(lang, "en")
 
@@ -100,7 +105,9 @@ def translate_text_value(text: str, source_lang: str, target_lang: str) -> str:
     if google_lang(source_lang) == google_lang(target_lang):
         return text
 
-    if translator is not None:
+    deepl_supported = {"TR", "RU", "UK", "EN", "EN-US"}
+
+    if translator is not None and source_lang in deepl_supported and target_lang in deepl_supported:
         try:
             result = translator.translate_text(
                 text,
