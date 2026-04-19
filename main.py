@@ -16,7 +16,8 @@ app = FastAPI(title="BridgeCall Backend")
 DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
+WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
 fallback_translator = GoogleTranslator
@@ -58,6 +59,27 @@ def whisper_lang(lang: str) -> str:
 
 def clean_transcript(text: str) -> str:
     return " ".join((text or "").split()).strip()
+
+
+def looks_final(text: str) -> bool:
+    if not text:
+        return False
+    return text.endswith((".", "!", "?", "…"))
+
+
+def dedupe_overlap(previous: str, current: str) -> str:
+    previous = clean_transcript(previous)
+    current = clean_transcript(current)
+    if not previous:
+        return current
+    if current.startswith(previous):
+        return current
+    # Suffix-prefix overlap
+    max_k = min(len(previous), len(current))
+    for k in range(max_k, 4, -1):
+        if previous[-k:] == current[:k]:
+            return previous + current[k:]
+    return current
 
 
 def room_payload(room_id: str):
@@ -133,7 +155,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info), "whisper_model": WHISPER_MODEL_SIZE, "whisper_beam_size": WHISPER_BEAM_SIZE}
+    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info), "whisper_model": WHISPER_MODEL_SIZE, "whisper_beam_size": WHISPER_BEAM_SIZE, "whisper_vad_filter": WHISPER_VAD_FILTER}
 
 
 async def broadcast_room_state(room_id: str):
@@ -365,6 +387,9 @@ async def signal_socket(websocket: WebSocket):
 async def translate_socket(websocket: WebSocket):
     await websocket.accept()
 
+    last_partial = ""
+    stable_hits = 0
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -387,8 +412,10 @@ async def translate_socket(websocket: WebSocket):
                     temp_path,
                     beam_size=WHISPER_BEAM_SIZE,
                     language=whisper_lang(source_lang),
-                    vad_filter=True,
+                    vad_filter=WHISPER_VAD_FILTER,
                     condition_on_previous_text=False,
+                    without_timestamps=True,
+                    task="transcribe",
                 )
                 text = clean_transcript(" ".join(segment.text for segment in segments))
 
@@ -398,21 +425,40 @@ async def translate_socket(websocket: WebSocket):
                     pass
 
                 if not text:
+                    stable_hits = 0
                     await safe_send(websocket, {"error": "ses algılanamadı"})
                     continue
 
-                translated = translate_text_value(text, source_lang, target_lang)
+                merged_text = dedupe_overlap(last_partial, text)
+                stage = "partial"
+
+                if merged_text == last_partial:
+                    stable_hits += 1
+                else:
+                    stable_hits = 0
+
+                if looks_final(merged_text) or stable_hits >= 1:
+                    stage = "final"
+
+                translated = translate_text_value(merged_text, source_lang, target_lang)
 
                 await safe_send(
                     websocket,
                     {
-                        "original": text,
+                        "original": merged_text,
                         "translated": translated,
-                        "stage": "partial",
+                        "stage": stage,
                         "sourceLang": source_lang,
                         "targetLang": target_lang,
                     },
                 )
+
+                if stage == "final":
+                    last_partial = ""
+                    stable_hits = 0
+                else:
+                    last_partial = merged_text
+
             except Exception as e:
                 await safe_send(websocket, {"error": str(e)})
 
