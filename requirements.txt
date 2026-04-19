@@ -1,6 +1,6 @@
 fastapi
-uvicorn[standard]
-python-multipart
+uvicorn
+websockets
 deepl
 deep-translator
 faster-whisper

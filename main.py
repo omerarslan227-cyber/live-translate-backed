@@ -13,37 +13,12 @@ from faster_whisper import WhisperModel
 
 app = FastAPI(title="BridgeCall Backend")
 
-DEEPL_AUTH_KEY = (os.getenv("DEEPL_AUTH_KEY") or "").strip()
+DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 
+translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
 fallback_translator = GoogleTranslator
-model = WhisperModel("tiny", device="cpu", compute_type="int8")
-
-
-def build_translator():
-    if not DEEPL_AUTH_KEY:
-        print("DEEPL_AUTH_KEY bulunamadı, Google fallback kullanılacak.")
-        return None
-
-    try:
-        translator = deepl.Translator(DEEPL_AUTH_KEY)
-        translator.get_usage()
-        print("DeepL bağlantısı başarılı.")
-        return translator
-    except Exception as exc:
-        print(f"DeepL başlatılamadı: {exc}")
-        return None
-
-
-translator = build_translator()
-
-def user_safe_error_message(exc: Exception) -> str:
-    message = str(exc).lower()
-    if 'authorization failure' in message or 'forbidden' in message or 'auth_key' in message:
-        return 'Çeviri servisine erişilemedi'
-    if 'quota' in message or 'limit' in message:
-        return 'Çeviri limiti doldu'
-    return 'Çeviri şu anda kullanılamıyor'
+model = WhisperModel("small", device="cpu", compute_type="int8")
 
 client_info = {}
 signal_rooms = {}
@@ -55,8 +30,6 @@ def normalize_source_lang(lang: str):
     lang = lang.upper()
     if lang == "EN-US":
         return "EN"
-    if lang in {"KA-GE", "GE"}:
-        return "KA"
     return lang
 
 
@@ -66,8 +39,6 @@ def normalize_target_lang(lang: str):
     lang = lang.upper()
     if lang == "EN":
         return "EN-US"
-    if lang in {"KA-GE", "GE"}:
-        return "KA"
     return lang
 
 
@@ -90,7 +61,6 @@ def google_lang(lang: str) -> str:
         "UK": "uk",
         "EN-US": "en",
         "EN": "en",
-        "KA": "ka",
     }
     return mapping.get(lang, "en")
 
@@ -102,29 +72,17 @@ def translate_text_value(text: str, source_lang: str, target_lang: str) -> str:
     source_lang = normalize_source_lang(source_lang)
     target_lang = normalize_target_lang(target_lang)
 
-    if google_lang(source_lang) == google_lang(target_lang):
-        return text
+    if translator is not None:
+        return translator.translate_text(
+            text,
+            source_lang=source_lang,
+            target_lang=target_lang,
+        ).text
 
-    deepl_supported = {"TR", "RU", "UK", "EN", "EN-US"}
-
-    if translator is not None and source_lang in deepl_supported and target_lang in deepl_supported:
-        try:
-            result = translator.translate_text(
-                text,
-                source_lang=source_lang,
-                target_lang=target_lang,
-            )
-            return result.text
-        except Exception as exc:
-            print(f"DeepL çeviri hatası, Google fallback'e geçiliyor: {exc}")
-
-    try:
-        return fallback_translator(
-            source=google_lang(source_lang),
-            target=google_lang(target_lang),
-        ).translate(text)
-    except Exception as exc:
-        raise Exception(f"DeepL ve Google çeviri başarısız: {exc}")
+    return fallback_translator(
+        source=google_lang(source_lang),
+        target=google_lang(target_lang),
+    ).translate(text)
 
 
 async def safe_send(websocket: WebSocket, payload: dict):
@@ -150,27 +108,9 @@ async def root():
         {
             "ok": True,
             "service": "bridgecall-backend",
-            "routes": ["/signal", "/translate", "/deepl-check"],
+            "routes": ["/signal", "/translate"],
         }
     )
-
-
-@app.get("/deepl-check")
-async def deepl_check():
-    if not DEEPL_AUTH_KEY:
-        return {"ok": False, "message": "DEEPL_AUTH_KEY yok"}
-
-    try:
-        usage = deepl.Translator(DEEPL_AUTH_KEY).get_usage()
-        character_usage = getattr(usage, "character", None)
-        return {
-            "ok": True,
-            "message": "DeepL çalışıyor",
-            "character_count": getattr(character_usage, "count", None),
-            "character_limit": getattr(character_usage, "limit", None),
-        }
-    except Exception as exc:
-        return {"ok": False, "message": str(exc)}
 
 
 @app.websocket("/signal")
@@ -305,7 +245,7 @@ async def signal_socket(websocket: WebSocket):
                     try:
                         translated_text = translate_text_value(text, source_lang, target_lang)
                     except Exception as exc:
-                        translated_text = user_safe_error_message(exc)
+                        translated_text = f"Çeviri hatası: {exc}"
 
                 payload = {
                     "type": "chat_message",
@@ -383,24 +323,22 @@ async def translate_socket(websocket: WebSocket):
                 await safe_send(websocket, {"error": "audio alanı boş"})
                 continue
 
-            temp_path = None
             try:
                 audio_bytes = base64.b64decode(audio_b64)
-
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
                     f.write(audio_bytes)
                     temp_path = f.name
 
-                segments, _ = model.transcribe(
-                    temp_path,
-                    beam_size=1,
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                )
+                segments, _ = model.transcribe(temp_path, beam_size=1)
                 text = " ".join(segment.text for segment in segments).strip()
 
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
                 if not text:
-                    await safe_send(websocket, {"error": "Net ses algılanamadı, mikrofona biraz daha yakın konuş"})
+                    await safe_send(websocket, {"error": "ses algılanamadı"})
                     continue
 
                 translated = translate_text_value(text, source_lang, target_lang)
@@ -415,13 +353,7 @@ async def translate_socket(websocket: WebSocket):
                     },
                 )
             except Exception as e:
-                await safe_send(websocket, {"error": user_safe_error_message(e), "original": "", "translated": ""})
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
+                await safe_send(websocket, {"error": str(e)})
 
     except WebSocketDisconnect:
         pass
