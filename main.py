@@ -108,9 +108,23 @@ async def root():
         {
             "ok": True,
             "service": "bridgecall-backend",
-            "routes": ["/signal", "/translate"],
+            "routes": ["/signal", "/translate", "/health"],
         }
     )
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info)}
+
+
+async def broadcast_room_state(room_id: str):
+    if room_id not in signal_rooms:
+        return
+    room = signal_rooms[room_id]
+    payload = {"type": "room_state", **room_payload(room_id)}
+    for member in list(room["members"]):
+        await safe_send(member, payload)
 
 
 @app.websocket("/signal")
@@ -151,6 +165,7 @@ async def signal_socket(websocket: WebSocket):
                 client_info[websocket]["room"] = room_id
 
                 await safe_send(websocket, {"type": "room_created", **room_payload(room_id)})
+                await broadcast_room_state(room_id)
                 continue
 
             if msg_type == "request_join":
@@ -203,6 +218,7 @@ async def signal_socket(websocket: WebSocket):
                     for member in list(room["members"]):
                         if member != requester_ws:
                             await safe_send(member, {"type": "member_joined", "room": room_id, "clientId": requester_id})
+                    await broadcast_room_state(room_id)
                 else:
                     await safe_send(requester_ws, {"type": "join_rejected", "room": room_id})
                 continue
@@ -224,6 +240,7 @@ async def signal_socket(websocket: WebSocket):
                     else:
                         for member in list(room["members"]):
                             await safe_send(member, {"type": "member_left", "room": room_id, "clientId": cid})
+                        await broadcast_room_state(room_id)
 
                     client_info[websocket]["room"] = None
 
@@ -275,6 +292,24 @@ async def signal_socket(websocket: WebSocket):
                         await safe_send(member, payload)
                 continue
 
+            if msg_type == "media_state":
+                room_id = data.get("room")
+                if room_id not in signal_rooms:
+                    continue
+                room = signal_rooms[room_id]
+                payload = {
+                    "type": "media_state",
+                    "room": room_id,
+                    "senderId": client_id,
+                    "micOn": bool(data.get("micOn", True)),
+                    "camOn": bool(data.get("camOn", True)),
+                    "subtitlesOn": bool(data.get("subtitlesOn", True)),
+                }
+                for member in list(room["members"]):
+                    if member != websocket:
+                        await safe_send(member, payload)
+                continue
+
             if msg_type in ["offer", "answer", "candidate"]:
                 room_id = data.get("room")
                 if room_id not in signal_rooms:
@@ -303,6 +338,7 @@ async def signal_socket(websocket: WebSocket):
             else:
                 for member in list(room["members"]):
                     await safe_send(member, {"type": "member_left", "room": room_id, "clientId": cid})
+                await broadcast_room_state(room_id)
 
         client_info.pop(websocket, None)
 
