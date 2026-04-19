@@ -15,10 +15,13 @@ app = FastAPI(title="BridgeCall Backend")
 
 DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "4"))
+WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
 fallback_translator = GoogleTranslator
-model = WhisperModel("small", device="cpu", compute_type="int8")
+model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
 client_info = {}
 signal_rooms = {}
@@ -40,6 +43,22 @@ def normalize_target_lang(lang: str):
     if lang == "EN":
         return "EN-US"
     return lang
+
+
+def whisper_lang(lang: str) -> str:
+    lang = normalize_source_lang(lang)
+    mapping = {
+        "TR": "tr",
+        "RU": "ru",
+        "UK": "uk",
+        "EN": "en",
+        "EN-US": "en",
+    }
+    return mapping.get(lang, "en")
+
+
+def clean_transcript(text: str) -> str:
+    return " ".join((text or "").split()).strip()
 
 
 def room_payload(room_id: str):
@@ -115,7 +134,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info)}
+    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info), "whisper_model": WHISPER_MODEL_SIZE, "whisper_beam_size": WHISPER_BEAM_SIZE, "whisper_vad_filter": WHISPER_VAD_FILTER}
 
 
 async def broadcast_room_state(room_id: str):
@@ -365,8 +384,14 @@ async def translate_socket(websocket: WebSocket):
                     f.write(audio_bytes)
                     temp_path = f.name
 
-                segments, _ = model.transcribe(temp_path, beam_size=1)
-                text = " ".join(segment.text for segment in segments).strip()
+                segments, _ = model.transcribe(
+                    temp_path,
+                    beam_size=WHISPER_BEAM_SIZE,
+                    language=whisper_lang(source_lang),
+                    vad_filter=WHISPER_VAD_FILTER,
+                    condition_on_previous_text=False,
+                )
+                text = clean_transcript(" ".join(segment.text for segment in segments))
 
                 try:
                     os.remove(temp_path)
