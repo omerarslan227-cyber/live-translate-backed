@@ -16,8 +16,7 @@ app = FastAPI(title="BridgeCall Backend")
 DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "4"))
-WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
 fallback_translator = GoogleTranslator
@@ -134,7 +133,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info), "whisper_model": WHISPER_MODEL_SIZE, "whisper_beam_size": WHISPER_BEAM_SIZE, "whisper_vad_filter": WHISPER_VAD_FILTER}
+    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info), "whisper_model": WHISPER_MODEL_SIZE, "whisper_beam_size": WHISPER_BEAM_SIZE}
 
 
 async def broadcast_room_state(room_id: str):
@@ -388,7 +387,7 @@ async def translate_socket(websocket: WebSocket):
                     temp_path,
                     beam_size=WHISPER_BEAM_SIZE,
                     language=whisper_lang(source_lang),
-                    vad_filter=WHISPER_VAD_FILTER,
+                    vad_filter=True,
                     condition_on_previous_text=False,
                 )
                 text = clean_transcript(" ".join(segment.text for segment in segments))
@@ -409,6 +408,7 @@ async def translate_socket(websocket: WebSocket):
                     {
                         "original": text,
                         "translated": translated,
+                        "stage": "partial",
                         "sourceLang": source_lang,
                         "targetLang": target_lang,
                     },
