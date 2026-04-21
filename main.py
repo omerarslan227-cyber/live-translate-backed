@@ -16,7 +16,7 @@ app = FastAPI(title="BridgeCall Backend")
 DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY", "")
 PORT = int(os.getenv("PORT", "8000"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 
 translator = deepl.Translator(DEEPL_AUTH_KEY) if DEEPL_AUTH_KEY else None
@@ -155,7 +155,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info), "whisper_model": WHISPER_MODEL_SIZE, "whisper_beam_size": WHISPER_BEAM_SIZE, "whisper_vad_filter": WHISPER_VAD_FILTER}
+    return {"ok": True, "rooms": len(signal_rooms), "clients": len(client_info), "whisper_model": WHISPER_MODEL_SIZE, "whisper_beam_size": WHISPER_BEAM_SIZE, "whisper_vad_filter": WHISPER_VAD_FILTER, "subtitle_mode": "partial_final_bidirectional"}
 
 
 async def broadcast_room_state(room_id: str):
@@ -285,6 +285,26 @@ async def signal_socket(websocket: WebSocket):
                     client_info[websocket]["room"] = None
 
                 await safe_send(websocket, {"type": "left_room"})
+                continue
+
+            if msg_type == "subtitle_packet":
+                room_id = data.get("room")
+                if room_id not in signal_rooms:
+                    continue
+                room = signal_rooms[room_id]
+                payload = {
+                    "type": "subtitle_packet",
+                    "room": room_id,
+                    "senderId": client_id,
+                    "stage": data.get("stage", "partial"),
+                    "original": data.get("original", ""),
+                    "translated": data.get("translated", ""),
+                    "sourceLang": data.get("sourceLang"),
+                    "targetLang": data.get("targetLang"),
+                }
+                for member in list(room["members"]):
+                    if member != websocket:
+                        await safe_send(member, payload)
                 continue
 
             if msg_type == "chat_message":
