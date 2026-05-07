@@ -32,9 +32,13 @@ PORT = int(os.getenv("PORT", "8000"))
 DEEPL_AUTH_KEY = os.getenv("DEEPL_API_KEY") or os.getenv("DEEPL_AUTH_KEY", "")
 DEEPL_API_URL = os.getenv("DEEPL_API_URL", "")
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE") or os.getenv("WHISPER_MODEL", "small")
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.68"))
+WHISPER_LOG_PROB_THRESHOLD = float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-0.65"))
+WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.4"))
+WHISPER_TEMPERATURE = float(os.getenv("WHISPER_TEMPERATURE", "0"))
 PARTIAL_TRANSCRIBE_INTERVAL_SECONDS = float(os.getenv("PARTIAL_TRANSCRIBE_INTERVAL_SECONDS", "0.9"))
 ROLLING_TRANSCRIBE_WINDOW_SECONDS = float(os.getenv("ROLLING_TRANSCRIBE_WINDOW_SECONDS", "1.8"))
 FINAL_SILENCE_SECONDS = float(os.getenv("FINAL_SILENCE_SECONDS", "0.75"))
@@ -51,6 +55,23 @@ translation_cache: dict[tuple[str, str, str], str] = {}
 
 legacy_client_info: dict[WebSocket, dict[str, Any]] = {}
 legacy_signal_rooms: dict[str, dict[str, Any]] = {}
+
+LOW_VALUE_TRANSCRIPTS = {
+    "",
+    ".",
+    "...",
+    "thanks for watching",
+    "thank you for watching",
+    "altyazi m.k.",
+    "abone olmayi unutmayin",
+}
+
+TRANSCRIPTION_PROMPTS = {
+    "tr": "Live video call subtitle. Transcribe natural Turkish speech accurately and briefly.",
+    "ru": "Live video call subtitle. Transcribe natural Russian speech accurately and briefly.",
+    "uk": "Live video call subtitle. Transcribe natural Ukrainian speech accurately and briefly.",
+    "en": "Live video call subtitle. Transcribe natural English speech accurately and briefly.",
+}
 
 
 @dataclass
@@ -267,7 +288,46 @@ def google_lang(lang: str) -> str:
 
 
 def clean_transcript(text: str) -> str:
-    return " ".join((text or "").split()).strip()
+    cleaned = " ".join((text or "").replace("\n", " ").split()).strip()
+    return cleaned.strip(" -–—")
+
+
+def is_low_value_transcript(text: str) -> bool:
+    normalized = clean_transcript(text).lower().strip(" .!?")
+    return normalized in LOW_VALUE_TRANSCRIPTS or len(normalized) < 2
+
+
+def transcription_prompt(source_lang: str, previous_text: str = "") -> str:
+    lang = whisper_lang(source_lang)
+    prompt = TRANSCRIPTION_PROMPTS.get(lang, TRANSCRIPTION_PROMPTS["en"])
+    previous_text = clean_transcript(previous_text)
+    if previous_text:
+        return f"{prompt} Previous context: {previous_text[-220:]}"
+    return prompt
+
+
+def stable_segment_text(segments) -> tuple[str, float]:
+    accepted: list[str] = []
+    confidences: list[float] = []
+
+    for segment in segments:
+        text = clean_transcript(getattr(segment, "text", ""))
+        if not text:
+            continue
+
+        no_speech_prob = float(getattr(segment, "no_speech_prob", 0) or 0)
+        avg_logprob = float(getattr(segment, "avg_logprob", 0) or 0)
+        if no_speech_prob > WHISPER_NO_SPEECH_THRESHOLD:
+            continue
+        if avg_logprob < WHISPER_LOG_PROB_THRESHOLD:
+            continue
+
+        accepted.append(text)
+        confidences.append(max(0.0, min(1.0, 1.0 + avg_logprob)))
+
+    text = clean_transcript(" ".join(accepted))
+    confidence = round(sum(confidences) / len(confidences), 3) if confidences else 0.0
+    return text, confidence
 
 
 def translate_text_value(text: str, source_lang: str, target_lang: str) -> str:
@@ -381,7 +441,7 @@ async def transcribe_pcm(pcm: bytes, config: TranslationConfig) -> str:
             pass
 
 
-async def transcribe_wav(path: str, source_lang: str) -> str:
+async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -> str:
     loop = asyncio.get_running_loop()
 
     def run_transcribe() -> str:
@@ -390,9 +450,21 @@ async def transcribe_wav(path: str, source_lang: str) -> str:
             beam_size=WHISPER_BEAM_SIZE,
             language=whisper_lang(source_lang),
             vad_filter=WHISPER_VAD_FILTER,
+            vad_parameters={
+                "min_silence_duration_ms": 450,
+                "speech_pad_ms": 280,
+            },
+            initial_prompt=transcription_prompt(source_lang, previous_text),
+            temperature=WHISPER_TEMPERATURE,
+            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+            log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+            compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
             condition_on_previous_text=False,
         )
-        return clean_transcript(" ".join(segment.text for segment in segments))
+        text, _confidence = stable_segment_text(segments)
+        if is_low_value_transcript(text):
+            return ""
+        return text
 
     return await loop.run_in_executor(None, run_transcribe)
 
@@ -424,6 +496,9 @@ async def health() -> dict[str, Any]:
         "whisper_model": WHISPER_MODEL_SIZE,
         "whisper_beam_size": WHISPER_BEAM_SIZE,
         "whisper_vad_filter": WHISPER_VAD_FILTER,
+        "whisper_no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
+        "whisper_log_prob_threshold": WHISPER_LOG_PROB_THRESHOLD,
+        "whisper_compression_ratio_threshold": WHISPER_COMPRESSION_RATIO_THRESHOLD,
         "deepl_configured": bool(DEEPL_AUTH_KEY),
     }
 
@@ -627,6 +702,7 @@ async def leave_legacy_room(websocket: WebSocket) -> None:
 @app.websocket("/translate")
 async def legacy_translate_socket(websocket: WebSocket) -> None:
     await websocket.accept()
+    previous_text = ""
     try:
         while True:
             raw = await websocket.receive_text()
@@ -634,6 +710,7 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
             audio_b64 = data.get("audio")
             source_lang = normalize_source_lang(data.get("sourceLang", "TR"))
             target_lang = normalize_target_lang(data.get("targetLang", "RU"))
+            client_previous_text = clean_transcript(data.get("previousText", ""))
 
             if not audio_b64:
                 await safe_send(websocket, {"error": "audio alani bos"})
@@ -645,16 +722,17 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
                     file.write(audio_bytes)
                     temp_path = file.name
                 try:
-                    text = await transcribe_wav(temp_path, source_lang)
+                    text = await transcribe_wav(temp_path, source_lang, previous_text or client_previous_text)
                 finally:
                     try:
                         os.remove(temp_path)
                     except OSError:
                         pass
                 if not text:
-                    await safe_send(websocket, {"error": "ses algilanamadi"})
+                    await safe_send(websocket, {"noSpeech": True})
                     continue
                 translated = translate_text_value(text, source_lang, target_lang)
+                previous_text = clean_transcript(f"{previous_text} {text}")[-500:]
                 await safe_send(
                     websocket,
                     {
