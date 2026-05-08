@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import math
 import os
 import struct
@@ -18,6 +19,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("bridgecall.voice")
 
 app = FastAPI(title="BridgeCall Backend")
 app.add_middleware(
@@ -213,8 +217,17 @@ class AudioTranslationSession:
 
     async def _process(self, pcm: bytes, is_final: bool, generation: int) -> None:
         try:
+            started = time.perf_counter()
             text = await transcribe_pcm(pcm, self.config)
+            stt_ms = int((time.perf_counter() - started) * 1000)
             if not text:
+                logger.info(
+                    "modern_stt_no_speech room=%s peer=%s bytes=%s stt_ms=%s",
+                    self.room,
+                    self.peer_id,
+                    len(pcm),
+                    stt_ms,
+                )
                 return
             if not is_final and generation != self.generation:
                 return
@@ -222,7 +235,22 @@ class AudioTranslationSession:
                 return
             if not is_final:
                 self.last_partial_text = text
+            translate_started = time.perf_counter()
             translated = translate_text_value(text, self.config.source_language, self.config.target_language)
+            translate_ms = int((time.perf_counter() - translate_started) * 1000)
+            total_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "modern_caption room=%s peer=%s final=%s bytes=%s stt_ms=%s translate_ms=%s total_ms=%s text_len=%s translated_len=%s",
+                self.room,
+                self.peer_id,
+                is_final,
+                len(pcm),
+                stt_ms,
+                translate_ms,
+                total_ms,
+                len(text),
+                len(translated),
+            )
             payload = {
                 "type": "caption",
                 "text": text,
@@ -230,6 +258,11 @@ class AudioTranslationSession:
                 "source_language": self.config.source_language,
                 "target_language": self.config.target_language,
                 "is_final": is_final,
+                "timing_ms": {
+                    "stt": stt_ms,
+                    "translation": translate_ms,
+                    "total": total_ms,
+                },
             }
             await manager.send("translation", self.room, self.peer_id, payload)
         except Exception as exc:
@@ -705,6 +738,7 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
     previous_text = ""
     try:
         while True:
+            request_started = time.perf_counter()
             raw = await websocket.receive_text()
             data = json.loads(raw)
             audio_b64 = data.get("audio")
@@ -717,32 +751,97 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
                 continue
 
             try:
+                decode_started = time.perf_counter()
                 audio_bytes = base64.b64decode(audio_b64)
+                decode_ms = int((time.perf_counter() - decode_started) * 1000)
+                if len(audio_bytes) < 12000:
+                    logger.info(
+                        "legacy_audio_too_small bytes=%s source=%s target=%s",
+                        len(audio_bytes),
+                        source_lang,
+                        target_lang,
+                    )
+                    await safe_send(
+                        websocket,
+                        {
+                            "noSpeech": True,
+                            "audioBytes": len(audio_bytes),
+                            "format": "pcm16wav",
+                            "sampleRate": 16000,
+                            "timingMs": {"decode": decode_ms, "total": int((time.perf_counter() - request_started) * 1000)},
+                        },
+                    )
+                    continue
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as file:
                     file.write(audio_bytes)
                     temp_path = file.name
                 try:
+                    stt_started = time.perf_counter()
                     text = await transcribe_wav(temp_path, source_lang, previous_text or client_previous_text)
+                    stt_ms = int((time.perf_counter() - stt_started) * 1000)
                 finally:
                     try:
                         os.remove(temp_path)
                     except OSError:
                         pass
                 if not text:
-                    await safe_send(websocket, {"noSpeech": True})
+                    total_ms = int((time.perf_counter() - request_started) * 1000)
+                    logger.info(
+                        "legacy_stt_no_speech bytes=%s source=%s target=%s stt_ms=%s total_ms=%s",
+                        len(audio_bytes),
+                        source_lang,
+                        target_lang,
+                        stt_ms,
+                        total_ms,
+                    )
+                    await safe_send(
+                        websocket,
+                        {
+                            "noSpeech": True,
+                            "audioBytes": len(audio_bytes),
+                            "format": "pcm16wav",
+                            "sampleRate": 16000,
+                            "timingMs": {"decode": decode_ms, "stt": stt_ms, "total": total_ms},
+                        },
+                    )
                     continue
+                translate_started = time.perf_counter()
                 translated = translate_text_value(text, source_lang, target_lang)
+                translate_ms = int((time.perf_counter() - translate_started) * 1000)
+                total_ms = int((time.perf_counter() - request_started) * 1000)
                 previous_text = clean_transcript(f"{previous_text} {text}")[-500:]
+                logger.info(
+                    "legacy_caption bytes=%s source=%s target=%s stt_ms=%s translate_ms=%s total_ms=%s text_len=%s translated_len=%s",
+                    len(audio_bytes),
+                    source_lang,
+                    target_lang,
+                    stt_ms,
+                    translate_ms,
+                    total_ms,
+                    len(text),
+                    len(translated),
+                )
                 await safe_send(
                     websocket,
                     {
+                        "stage": "final",
                         "original": text,
                         "translated": translated,
                         "sourceLang": source_lang,
                         "targetLang": target_lang,
+                        "audioBytes": len(audio_bytes),
+                        "format": "pcm16wav",
+                        "sampleRate": 16000,
+                        "timingMs": {
+                            "decode": decode_ms,
+                            "stt": stt_ms,
+                            "translation": translate_ms,
+                            "total": total_ms,
+                        },
                     },
                 )
             except Exception as exc:
+                logger.exception("legacy_translate_error")
                 await safe_send(websocket, {"error": str(exc)})
     except WebSocketDisconnect:
         pass
