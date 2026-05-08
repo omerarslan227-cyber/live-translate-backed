@@ -339,7 +339,7 @@ def transcription_prompt(source_lang: str, previous_text: str = "") -> str:
     return prompt
 
 
-def stable_segment_text(segments) -> tuple[str, float]:
+def stable_segment_text(segments, *, relaxed: bool = False) -> tuple[str, float]:
     accepted: list[str] = []
     confidences: list[float] = []
 
@@ -350,9 +350,11 @@ def stable_segment_text(segments) -> tuple[str, float]:
 
         no_speech_prob = float(getattr(segment, "no_speech_prob", 0) or 0)
         avg_logprob = float(getattr(segment, "avg_logprob", 0) or 0)
-        if no_speech_prob > WHISPER_NO_SPEECH_THRESHOLD:
+        no_speech_limit = 0.92 if relaxed else WHISPER_NO_SPEECH_THRESHOLD
+        log_prob_limit = -1.15 if relaxed else WHISPER_LOG_PROB_THRESHOLD
+        if no_speech_prob > no_speech_limit:
             continue
-        if avg_logprob < WHISPER_LOG_PROB_THRESHOLD:
+        if avg_logprob < log_prob_limit:
             continue
 
         accepted.append(text)
@@ -452,6 +454,15 @@ def pcm_rms(pcm: bytes) -> int:
     return int(math.sqrt(sum(sample * sample for sample in samples) / len(samples)))
 
 
+def wav_rms(path: str) -> int:
+    try:
+        with wave.open(path, "rb") as wav:
+            pcm = wav.readframes(wav.getnframes())
+        return pcm_rms(pcm)
+    except Exception:
+        return 0
+
+
 def write_wav(pcm: bytes, sample_rate: int, channels: int) -> str:
     file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     file.close()
@@ -478,6 +489,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
     loop = asyncio.get_running_loop()
 
     def run_transcribe() -> str:
+        audio_rms = wav_rms(path)
         segments, _ = model.transcribe(
             path,
             beam_size=WHISPER_BEAM_SIZE,
@@ -494,10 +506,68 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
             condition_on_previous_text=False,
         )
-        text, _confidence = stable_segment_text(segments)
+        segment_list = list(segments)
+        text, confidence = stable_segment_text(segment_list)
         if is_low_value_transcript(text):
+            text = ""
+        if text:
+            logger.info(
+                "stt_primary_ok source=%s rms=%s confidence=%s segments=%s text_len=%s",
+                source_lang,
+                audio_rms,
+                confidence,
+                len(segment_list),
+                len(text),
+            )
+            return text
+
+        if audio_rms < VAD_RMS_THRESHOLD:
+            logger.info(
+                "stt_primary_no_speech_low_rms source=%s rms=%s segments=%s",
+                source_lang,
+                audio_rms,
+                len(segment_list),
+            )
             return ""
-        return text
+
+        logger.info(
+            "stt_primary_empty_retry_relaxed source=%s rms=%s segments=%s",
+            source_lang,
+            audio_rms,
+            len(segment_list),
+        )
+        retry_segments, _ = model.transcribe(
+            path,
+            beam_size=max(1, min(WHISPER_BEAM_SIZE, 3)),
+            language=whisper_lang(source_lang),
+            vad_filter=False,
+            initial_prompt=transcription_prompt(source_lang, previous_text),
+            temperature=0.2,
+            no_speech_threshold=0.92,
+            log_prob_threshold=-1.15,
+            compression_ratio_threshold=3.2,
+            condition_on_previous_text=False,
+        )
+        retry_list = list(retry_segments)
+        retry_text, retry_confidence = stable_segment_text(retry_list, relaxed=True)
+        if is_low_value_transcript(retry_text):
+            logger.info(
+                "stt_relaxed_low_value source=%s rms=%s segments=%s text=%r",
+                source_lang,
+                audio_rms,
+                len(retry_list),
+                retry_text,
+            )
+            return ""
+        logger.info(
+            "stt_relaxed_result source=%s rms=%s confidence=%s segments=%s text_len=%s",
+            source_lang,
+            audio_rms,
+            retry_confidence,
+            len(retry_list),
+            len(retry_text),
+        )
+        return retry_text
 
     return await loop.run_in_executor(None, run_transcribe)
 
