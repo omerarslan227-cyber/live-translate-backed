@@ -36,7 +36,7 @@ PORT = int(os.getenv("PORT", "8000"))
 DEEPL_AUTH_KEY = os.getenv("DEEPL_API_KEY") or os.getenv("DEEPL_AUTH_KEY", "")
 DEEPL_API_URL = os.getenv("DEEPL_API_URL", "")
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE") or os.getenv("WHISPER_MODEL", "small")
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.68"))
@@ -496,8 +496,8 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             language=whisper_lang(source_lang),
             vad_filter=WHISPER_VAD_FILTER,
             vad_parameters={
-                "min_silence_duration_ms": 450,
-                "speech_pad_ms": 280,
+                "min_silence_duration_ms": 260,
+                "speech_pad_ms": 160,
             },
             initial_prompt=transcription_prompt(source_lang, previous_text),
             temperature=WHISPER_TEMPERATURE,
@@ -538,7 +538,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
         )
         retry_segments, _ = model.transcribe(
             path,
-            beam_size=max(1, min(WHISPER_BEAM_SIZE, 3)),
+            beam_size=max(1, min(WHISPER_BEAM_SIZE, 2)),
             language=whisper_lang(source_lang),
             vad_filter=False,
             initial_prompt=transcription_prompt(source_lang, previous_text),
