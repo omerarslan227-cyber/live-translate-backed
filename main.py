@@ -52,6 +52,8 @@ MAX_SESSION_AUDIO_SECONDS = float(os.getenv("MAX_SESSION_AUDIO_SECONDS", "6.0"))
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
+STT_TARGET_RMS = int(os.getenv("STT_TARGET_RMS", "1600"))
+STT_MAX_GAIN = float(os.getenv("STT_MAX_GAIN", "6.0"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
 model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE)
@@ -463,6 +465,49 @@ def wav_rms(path: str) -> int:
         return 0
 
 
+def read_wav_pcm(path: str) -> tuple[bytes, int, int]:
+    with wave.open(path, "rb") as wav:
+        channels = wav.getnchannels()
+        sample_rate = wav.getframerate()
+        sample_width = wav.getsampwidth()
+        pcm = wav.readframes(wav.getnframes())
+    if sample_width != SAMPLE_WIDTH_BYTES:
+        return b"", sample_rate, channels
+    return pcm, sample_rate, channels
+
+
+def apply_gain_to_pcm(pcm: bytes, gain: float) -> bytes:
+    if gain <= 1.0 or len(pcm) < SAMPLE_WIDTH_BYTES:
+        return pcm
+    if len(pcm) % SAMPLE_WIDTH_BYTES:
+        pcm = pcm[: -(len(pcm) % SAMPLE_WIDTH_BYTES)]
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    amplified = [
+        max(-32768, min(32767, int(sample * gain)))
+        for sample in samples
+    ]
+    return struct.pack(f"<{len(amplified)}h", *amplified)
+
+
+def normalize_wav_for_stt(path: str) -> tuple[str, int, float]:
+    try:
+        pcm, sample_rate, channels = read_wav_pcm(path)
+    except Exception:
+        return path, 0, 1.0
+
+    original_rms = pcm_rms(pcm)
+    if original_rms <= 0 or original_rms >= STT_TARGET_RMS:
+        return path, original_rms, 1.0
+
+    gain = min(STT_MAX_GAIN, STT_TARGET_RMS / max(original_rms, 1))
+    if gain <= 1.05:
+        return path, original_rms, 1.0
+
+    amplified_pcm = apply_gain_to_pcm(pcm, gain)
+    normalized_path = write_wav(amplified_pcm, sample_rate, channels)
+    return normalized_path, original_rms, round(gain, 2)
+
+
 def write_wav(pcm: bytes, sample_rate: int, channels: int) -> str:
     file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     file.close()
@@ -489,9 +534,24 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
     loop = asyncio.get_running_loop()
 
     def run_transcribe() -> str:
-        audio_rms = wav_rms(path)
+        stt_path, audio_rms, gain = normalize_wav_for_stt(path)
+        if gain > 1.0:
+            logger.info(
+                "stt_audio_normalized source=%s original_rms=%s gain=%s",
+                source_lang,
+                audio_rms,
+                gain,
+            )
+
+        def cleanup_stt_path() -> None:
+            if stt_path != path:
+                try:
+                    os.remove(stt_path)
+                except OSError:
+                    pass
+
         segments, _ = model.transcribe(
-            path,
+            stt_path,
             beam_size=WHISPER_BEAM_SIZE,
             language=whisper_lang(source_lang),
             vad_filter=WHISPER_VAD_FILTER,
@@ -519,6 +579,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
                 len(segment_list),
                 len(text),
             )
+            cleanup_stt_path()
             return text
 
         if audio_rms < VAD_RMS_THRESHOLD:
@@ -528,6 +589,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
                 audio_rms,
                 len(segment_list),
             )
+            cleanup_stt_path()
             return ""
 
         logger.info(
@@ -537,7 +599,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             len(segment_list),
         )
         retry_segments, _ = model.transcribe(
-            path,
+            stt_path,
             beam_size=max(1, min(WHISPER_BEAM_SIZE, 2)),
             language=whisper_lang(source_lang),
             vad_filter=False,
@@ -558,6 +620,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
                 len(retry_list),
                 retry_text,
             )
+            cleanup_stt_path()
             return ""
         logger.info(
             "stt_relaxed_result source=%s rms=%s confidence=%s segments=%s text_len=%s",
@@ -567,6 +630,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             len(retry_list),
             len(retry_text),
         )
+        cleanup_stt_path()
         return retry_text
 
     return await loop.run_in_executor(None, run_transcribe)
