@@ -43,10 +43,10 @@ WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.
 WHISPER_LOG_PROB_THRESHOLD = float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-0.65"))
 WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.4"))
 WHISPER_TEMPERATURE = float(os.getenv("WHISPER_TEMPERATURE", "0"))
-PARTIAL_TRANSCRIBE_INTERVAL_SECONDS = float(os.getenv("PARTIAL_TRANSCRIBE_INTERVAL_SECONDS", "0.9"))
-ROLLING_TRANSCRIBE_WINDOW_SECONDS = float(os.getenv("ROLLING_TRANSCRIBE_WINDOW_SECONDS", "1.8"))
-FINAL_SILENCE_SECONDS = float(os.getenv("FINAL_SILENCE_SECONDS", "0.75"))
-MIN_TRANSCRIBE_SECONDS = float(os.getenv("MIN_TRANSCRIBE_SECONDS", "0.7"))
+PARTIAL_TRANSCRIBE_INTERVAL_SECONDS = float(os.getenv("PARTIAL_TRANSCRIBE_INTERVAL_SECONDS", "0.65"))
+ROLLING_TRANSCRIBE_WINDOW_SECONDS = float(os.getenv("ROLLING_TRANSCRIBE_WINDOW_SECONDS", "1.25"))
+FINAL_SILENCE_SECONDS = float(os.getenv("FINAL_SILENCE_SECONDS", "0.45"))
+MIN_TRANSCRIBE_SECONDS = float(os.getenv("MIN_TRANSCRIBE_SECONDS", "0.5"))
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "420"))
 STT_HARD_SILENCE_RMS = int(os.getenv("STT_HARD_SILENCE_RMS", "120"))
 MAX_SESSION_AUDIO_SECONDS = float(os.getenv("MAX_SESSION_AUDIO_SECONDS", "6.0"))
@@ -57,7 +57,7 @@ STT_TARGET_RMS = int(os.getenv("STT_TARGET_RMS", "1600"))
 STT_MAX_GAIN = float(os.getenv("STT_MAX_GAIN", "6.0"))
 STT_FAST_GAIN_THRESHOLD = float(os.getenv("STT_FAST_GAIN_THRESHOLD", "1.35"))
 STT_TRIM_FRAME_MS = int(os.getenv("STT_TRIM_FRAME_MS", "20"))
-STT_TRIM_PAD_MS = int(os.getenv("STT_TRIM_PAD_MS", "160"))
+STT_TRIM_PAD_MS = int(os.getenv("STT_TRIM_PAD_MS", "120"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
 model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE)
@@ -778,6 +778,10 @@ async def health() -> dict[str, Any]:
         "whisper_no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
         "whisper_log_prob_threshold": WHISPER_LOG_PROB_THRESHOLD,
         "whisper_compression_ratio_threshold": WHISPER_COMPRESSION_RATIO_THRESHOLD,
+        "partial_transcribe_interval_seconds": PARTIAL_TRANSCRIBE_INTERVAL_SECONDS,
+        "rolling_transcribe_window_seconds": ROLLING_TRANSCRIBE_WINDOW_SECONDS,
+        "final_silence_seconds": FINAL_SILENCE_SECONDS,
+        "min_transcribe_seconds": MIN_TRANSCRIBE_SECONDS,
         "vad_rms_threshold": VAD_RMS_THRESHOLD,
         "stt_hard_silence_rms": STT_HARD_SILENCE_RMS,
         "stt_target_rms": STT_TARGET_RMS,
