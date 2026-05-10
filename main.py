@@ -48,6 +48,7 @@ ROLLING_TRANSCRIBE_WINDOW_SECONDS = float(os.getenv("ROLLING_TRANSCRIBE_WINDOW_S
 FINAL_SILENCE_SECONDS = float(os.getenv("FINAL_SILENCE_SECONDS", "0.75"))
 MIN_TRANSCRIBE_SECONDS = float(os.getenv("MIN_TRANSCRIBE_SECONDS", "0.7"))
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "420"))
+STT_HARD_SILENCE_RMS = int(os.getenv("STT_HARD_SILENCE_RMS", "120"))
 MAX_SESSION_AUDIO_SECONDS = float(os.getenv("MAX_SESSION_AUDIO_SECONDS", "6.0"))
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -582,9 +583,9 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             cleanup_stt_path()
             return text
 
-        if audio_rms < VAD_RMS_THRESHOLD:
+        if audio_rms < STT_HARD_SILENCE_RMS and gain <= 1.0:
             logger.info(
-                "stt_primary_no_speech_low_rms source=%s rms=%s segments=%s",
+                "stt_primary_no_speech_hard_silence source=%s rms=%s segments=%s",
                 source_lang,
                 audio_rms,
                 len(segment_list),
@@ -593,9 +594,10 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             return ""
 
         logger.info(
-            "stt_primary_empty_retry_relaxed source=%s rms=%s segments=%s",
+            "stt_primary_empty_retry_relaxed source=%s rms=%s gain=%s segments=%s",
             source_lang,
             audio_rms,
+            gain,
             len(segment_list),
         )
         retry_segments, _ = model.transcribe(
@@ -666,6 +668,9 @@ async def health() -> dict[str, Any]:
         "whisper_no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
         "whisper_log_prob_threshold": WHISPER_LOG_PROB_THRESHOLD,
         "whisper_compression_ratio_threshold": WHISPER_COMPRESSION_RATIO_THRESHOLD,
+        "vad_rms_threshold": VAD_RMS_THRESHOLD,
+        "stt_hard_silence_rms": STT_HARD_SILENCE_RMS,
+        "stt_target_rms": STT_TARGET_RMS,
         "deepl_configured": bool(DEEPL_AUTH_KEY),
     }
 
