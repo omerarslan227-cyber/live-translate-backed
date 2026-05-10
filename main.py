@@ -56,6 +56,8 @@ SAMPLE_WIDTH_BYTES = 2
 STT_TARGET_RMS = int(os.getenv("STT_TARGET_RMS", "1600"))
 STT_MAX_GAIN = float(os.getenv("STT_MAX_GAIN", "6.0"))
 STT_FAST_GAIN_THRESHOLD = float(os.getenv("STT_FAST_GAIN_THRESHOLD", "1.35"))
+STT_TRIM_FRAME_MS = int(os.getenv("STT_TRIM_FRAME_MS", "20"))
+STT_TRIM_PAD_MS = int(os.getenv("STT_TRIM_PAD_MS", "160"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
 model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE)
@@ -491,23 +493,74 @@ def apply_gain_to_pcm(pcm: bytes, gain: float) -> bytes:
     return struct.pack(f"<{len(amplified)}h", *amplified)
 
 
-def normalize_wav_for_stt(path: str) -> tuple[str, int, float]:
+def trim_pcm_for_stt(pcm: bytes, sample_rate: int, channels: int, original_rms: int) -> tuple[bytes, int]:
+    if len(pcm) < sample_rate * channels * SAMPLE_WIDTH_BYTES // 4:
+        return pcm, 0
+    if sample_rate <= 0 or channels <= 0:
+        return pcm, 0
+
+    samples_per_frame = max(channels, int(sample_rate * channels * STT_TRIM_FRAME_MS / 1000))
+    samples_per_frame -= samples_per_frame % channels
+    frame_bytes = max(channels * SAMPLE_WIDTH_BYTES, samples_per_frame * SAMPLE_WIDTH_BYTES)
+    threshold = max(STT_HARD_SILENCE_RMS, min(VAD_RMS_THRESHOLD, int(max(original_rms, 1) * 0.45)))
+
+    first_voice = -1
+    last_voice = -1
+    usable_length = len(pcm) - (len(pcm) % frame_bytes)
+    for offset in range(0, usable_length, frame_bytes):
+        frame = pcm[offset : offset + frame_bytes]
+        if pcm_rms(frame) >= threshold:
+            if first_voice < 0:
+                first_voice = offset
+            last_voice = offset + frame_bytes
+
+    if first_voice < 0 or last_voice <= first_voice:
+        return pcm, 0
+
+    pad_bytes = int(sample_rate * channels * SAMPLE_WIDTH_BYTES * STT_TRIM_PAD_MS / 1000)
+    pad_bytes -= pad_bytes % (channels * SAMPLE_WIDTH_BYTES)
+    start = max(0, first_voice - pad_bytes)
+    end = min(len(pcm), last_voice + pad_bytes)
+    end -= (end - start) % (channels * SAMPLE_WIDTH_BYTES)
+    if end <= start:
+        return pcm, 0
+
+    trimmed = pcm[start:end]
+    if len(trimmed) < sample_rate * channels * SAMPLE_WIDTH_BYTES // 4:
+        return pcm, 0
+
+    trimmed_ms = int((len(pcm) - len(trimmed)) / (sample_rate * channels * SAMPLE_WIDTH_BYTES) * 1000)
+    if trimmed_ms < 120:
+        return pcm, 0
+    return trimmed, trimmed_ms
+
+
+def normalize_wav_for_stt(path: str) -> tuple[str, int, float, int]:
     try:
         pcm, sample_rate, channels = read_wav_pcm(path)
     except Exception:
-        return path, 0, 1.0
+        return path, 0, 1.0, 0
 
     original_rms = pcm_rms(pcm)
-    if original_rms <= 0 or original_rms >= STT_TARGET_RMS:
-        return path, original_rms, 1.0
+    if original_rms <= 0:
+        return path, original_rms, 1.0, 0
 
-    gain = min(STT_MAX_GAIN, STT_TARGET_RMS / max(original_rms, 1))
+    prepared_pcm, trimmed_ms = trim_pcm_for_stt(pcm, sample_rate, channels, original_rms)
+    prepared_rms = pcm_rms(prepared_pcm)
+    if prepared_rms >= STT_TARGET_RMS:
+        if trimmed_ms > 0:
+            return write_wav(prepared_pcm, sample_rate, channels), original_rms, 1.0, trimmed_ms
+        return path, original_rms, 1.0, 0
+
+    gain = min(STT_MAX_GAIN, STT_TARGET_RMS / max(prepared_rms, 1))
     if gain <= 1.05:
-        return path, original_rms, 1.0
+        if trimmed_ms > 0:
+            return write_wav(prepared_pcm, sample_rate, channels), original_rms, 1.0, trimmed_ms
+        return path, original_rms, 1.0, 0
 
-    amplified_pcm = apply_gain_to_pcm(pcm, gain)
+    amplified_pcm = apply_gain_to_pcm(prepared_pcm, gain)
     normalized_path = write_wav(amplified_pcm, sample_rate, channels)
-    return normalized_path, original_rms, round(gain, 2)
+    return normalized_path, original_rms, round(gain, 2), trimmed_ms
 
 
 def write_wav(pcm: bytes, sample_rate: int, channels: int) -> str:
@@ -536,13 +589,14 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
     loop = asyncio.get_running_loop()
 
     def run_transcribe() -> str:
-        stt_path, audio_rms, gain = normalize_wav_for_stt(path)
-        if gain > 1.0:
+        stt_path, audio_rms, gain, trimmed_ms = normalize_wav_for_stt(path)
+        if gain > 1.0 or trimmed_ms > 0:
             logger.info(
-                "stt_audio_normalized source=%s original_rms=%s gain=%s",
+                "stt_audio_prepared source=%s original_rms=%s gain=%s trimmed_ms=%s",
                 source_lang,
                 audio_rms,
                 gain,
+                trimmed_ms,
             )
 
         def cleanup_stt_path() -> None:
@@ -557,10 +611,11 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
         )
         if use_fast_relaxed:
             logger.info(
-                "stt_fast_relaxed_start source=%s rms=%s gain=%s",
+                "stt_fast_relaxed_start source=%s rms=%s gain=%s trimmed_ms=%s",
                 source_lang,
                 audio_rms,
                 gain,
+                trimmed_ms,
             )
             fast_segments, _ = model.transcribe(
                 stt_path,
@@ -578,20 +633,22 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             fast_text, fast_confidence = stable_segment_text(fast_list, relaxed=True)
             if is_low_value_transcript(fast_text):
                 logger.info(
-                    "stt_fast_relaxed_low_value source=%s rms=%s gain=%s segments=%s text=%r",
+                    "stt_fast_relaxed_low_value source=%s rms=%s gain=%s trimmed_ms=%s segments=%s text=%r",
                     source_lang,
                     audio_rms,
                     gain,
+                    trimmed_ms,
                     len(fast_list),
                     fast_text,
                 )
                 cleanup_stt_path()
                 return ""
             logger.info(
-                "stt_fast_relaxed_result source=%s rms=%s gain=%s confidence=%s segments=%s text_len=%s",
+                "stt_fast_relaxed_result source=%s rms=%s gain=%s trimmed_ms=%s confidence=%s segments=%s text_len=%s",
                 source_lang,
                 audio_rms,
                 gain,
+                trimmed_ms,
                 fast_confidence,
                 len(fast_list),
                 len(fast_text),
@@ -621,9 +678,10 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             text = ""
         if text:
             logger.info(
-                "stt_primary_ok source=%s rms=%s confidence=%s segments=%s text_len=%s",
+                "stt_primary_ok source=%s rms=%s trimmed_ms=%s confidence=%s segments=%s text_len=%s",
                 source_lang,
                 audio_rms,
+                trimmed_ms,
                 confidence,
                 len(segment_list),
                 len(text),
@@ -633,19 +691,21 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
 
         if audio_rms < STT_HARD_SILENCE_RMS and gain <= 1.0:
             logger.info(
-                "stt_primary_no_speech_hard_silence source=%s rms=%s segments=%s",
+                "stt_primary_no_speech_hard_silence source=%s rms=%s trimmed_ms=%s segments=%s",
                 source_lang,
                 audio_rms,
+                trimmed_ms,
                 len(segment_list),
             )
             cleanup_stt_path()
             return ""
 
         logger.info(
-            "stt_primary_empty_retry_relaxed source=%s rms=%s gain=%s segments=%s",
+            "stt_primary_empty_retry_relaxed source=%s rms=%s gain=%s trimmed_ms=%s segments=%s",
             source_lang,
             audio_rms,
             gain,
+            trimmed_ms,
             len(segment_list),
         )
         retry_segments, _ = model.transcribe(
@@ -664,18 +724,20 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
         retry_text, retry_confidence = stable_segment_text(retry_list, relaxed=True)
         if is_low_value_transcript(retry_text):
             logger.info(
-                "stt_relaxed_low_value source=%s rms=%s segments=%s text=%r",
+                "stt_relaxed_low_value source=%s rms=%s trimmed_ms=%s segments=%s text=%r",
                 source_lang,
                 audio_rms,
+                trimmed_ms,
                 len(retry_list),
                 retry_text,
             )
             cleanup_stt_path()
             return ""
         logger.info(
-            "stt_relaxed_result source=%s rms=%s confidence=%s segments=%s text_len=%s",
+            "stt_relaxed_result source=%s rms=%s trimmed_ms=%s confidence=%s segments=%s text_len=%s",
             source_lang,
             audio_rms,
+            trimmed_ms,
             retry_confidence,
             len(retry_list),
             len(retry_text),
@@ -720,6 +782,8 @@ async def health() -> dict[str, Any]:
         "stt_hard_silence_rms": STT_HARD_SILENCE_RMS,
         "stt_target_rms": STT_TARGET_RMS,
         "stt_fast_gain_threshold": STT_FAST_GAIN_THRESHOLD,
+        "stt_trim_frame_ms": STT_TRIM_FRAME_MS,
+        "stt_trim_pad_ms": STT_TRIM_PAD_MS,
         "deepl_configured": bool(DEEPL_AUTH_KEY),
     }
 
