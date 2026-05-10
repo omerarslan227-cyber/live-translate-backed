@@ -35,7 +35,7 @@ app.add_middleware(
 PORT = int(os.getenv("PORT", "8000"))
 DEEPL_AUTH_KEY = os.getenv("DEEPL_API_KEY") or os.getenv("DEEPL_AUTH_KEY", "")
 DEEPL_API_URL = os.getenv("DEEPL_API_URL", "")
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE") or os.getenv("WHISPER_MODEL", "base")
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE") or os.getenv("WHISPER_MODEL", "small")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
