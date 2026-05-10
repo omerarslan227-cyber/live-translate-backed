@@ -55,6 +55,7 @@ CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
 STT_TARGET_RMS = int(os.getenv("STT_TARGET_RMS", "1600"))
 STT_MAX_GAIN = float(os.getenv("STT_MAX_GAIN", "6.0"))
+STT_FAST_GAIN_THRESHOLD = float(os.getenv("STT_FAST_GAIN_THRESHOLD", "1.35"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
 model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE)
@@ -551,6 +552,53 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
                 except OSError:
                     pass
 
+        use_fast_relaxed = gain >= STT_FAST_GAIN_THRESHOLD or (
+            STT_HARD_SILENCE_RMS <= audio_rms < VAD_RMS_THRESHOLD
+        )
+        if use_fast_relaxed:
+            logger.info(
+                "stt_fast_relaxed_start source=%s rms=%s gain=%s",
+                source_lang,
+                audio_rms,
+                gain,
+            )
+            fast_segments, _ = model.transcribe(
+                stt_path,
+                beam_size=1,
+                language=whisper_lang(source_lang),
+                vad_filter=False,
+                initial_prompt=transcription_prompt(source_lang, previous_text),
+                temperature=0.0,
+                no_speech_threshold=0.94,
+                log_prob_threshold=-1.25,
+                compression_ratio_threshold=3.2,
+                condition_on_previous_text=False,
+            )
+            fast_list = list(fast_segments)
+            fast_text, fast_confidence = stable_segment_text(fast_list, relaxed=True)
+            if is_low_value_transcript(fast_text):
+                logger.info(
+                    "stt_fast_relaxed_low_value source=%s rms=%s gain=%s segments=%s text=%r",
+                    source_lang,
+                    audio_rms,
+                    gain,
+                    len(fast_list),
+                    fast_text,
+                )
+                cleanup_stt_path()
+                return ""
+            logger.info(
+                "stt_fast_relaxed_result source=%s rms=%s gain=%s confidence=%s segments=%s text_len=%s",
+                source_lang,
+                audio_rms,
+                gain,
+                fast_confidence,
+                len(fast_list),
+                len(fast_text),
+            )
+            cleanup_stt_path()
+            return fast_text
+
         segments, _ = model.transcribe(
             stt_path,
             beam_size=WHISPER_BEAM_SIZE,
@@ -671,6 +719,7 @@ async def health() -> dict[str, Any]:
         "vad_rms_threshold": VAD_RMS_THRESHOLD,
         "stt_hard_silence_rms": STT_HARD_SILENCE_RMS,
         "stt_target_rms": STT_TARGET_RMS,
+        "stt_fast_gain_threshold": STT_FAST_GAIN_THRESHOLD,
         "deepl_configured": bool(DEEPL_AUTH_KEY),
     }
 
