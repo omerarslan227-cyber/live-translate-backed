@@ -997,6 +997,9 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
             request_started = time.perf_counter()
             raw = await websocket.receive_text()
             data = json.loads(raw)
+            if data.get("type") == "ping":
+                await safe_send(websocket, {"type": "pong"})
+                continue
             audio_b64 = data.get("audio")
             source_lang = normalize_source_lang(data.get("sourceLang", "TR"))
             target_lang = normalize_target_lang(data.get("targetLang", "RU"))
