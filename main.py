@@ -58,9 +58,44 @@ STT_MAX_GAIN = float(os.getenv("STT_MAX_GAIN", "6.0"))
 STT_FAST_GAIN_THRESHOLD = float(os.getenv("STT_FAST_GAIN_THRESHOLD", "1.35"))
 STT_TRIM_FRAME_MS = int(os.getenv("STT_TRIM_FRAME_MS", "20"))
 STT_TRIM_PAD_MS = int(os.getenv("STT_TRIM_PAD_MS", "120"))
+STT_VAD_MIN_SILENCE_MS = int(os.getenv("STT_VAD_MIN_SILENCE_MS", "220"))
+STT_VAD_SPEECH_PAD_MS = int(os.getenv("STT_VAD_SPEECH_PAD_MS", "120"))
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
-model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE)
+
+
+@dataclass(frozen=True)
+class WhisperRuntimeConfig:
+    model_size: str
+    beam_size: int
+    vad_filter: bool
+    compute_type: str
+    partial_interval_seconds: float
+    rolling_window_seconds: float
+    final_silence_seconds: float
+    min_transcribe_seconds: float
+    vad_min_silence_ms: int
+    vad_speech_pad_ms: int
+
+
+WHISPER_RUNTIME = WhisperRuntimeConfig(
+    model_size=WHISPER_MODEL_SIZE,
+    beam_size=WHISPER_BEAM_SIZE,
+    vad_filter=WHISPER_VAD_FILTER,
+    compute_type=WHISPER_COMPUTE_TYPE,
+    partial_interval_seconds=PARTIAL_TRANSCRIBE_INTERVAL_SECONDS,
+    rolling_window_seconds=ROLLING_TRANSCRIBE_WINDOW_SECONDS,
+    final_silence_seconds=FINAL_SILENCE_SECONDS,
+    min_transcribe_seconds=MIN_TRANSCRIBE_SECONDS,
+    vad_min_silence_ms=STT_VAD_MIN_SILENCE_MS,
+    vad_speech_pad_ms=STT_VAD_SPEECH_PAD_MS,
+)
+
+model = WhisperModel(
+    WHISPER_RUNTIME.model_size,
+    device=os.getenv("WHISPER_DEVICE", "cpu"),
+    compute_type=WHISPER_RUNTIME.compute_type,
+)
 translation_cache: dict[tuple[str, str, str], str] = {}
 
 legacy_client_info: dict[WebSocket, dict[str, Any]] = {}
@@ -81,6 +116,12 @@ TRANSCRIPTION_PROMPTS = {
     "ru": "Live video call subtitle. Transcribe natural Russian speech accurately and briefly.",
     "uk": "Live video call subtitle. Transcribe natural Ukrainian speech accurately and briefly.",
     "en": "Live video call subtitle. Transcribe natural English speech accurately and briefly.",
+    "de": "Live video call subtitle. Transcribe natural German speech accurately and briefly.",
+    "nl": "Live video call subtitle. Transcribe natural Dutch speech accurately and briefly.",
+    "ar": "Live video call subtitle. Transcribe natural Arabic speech accurately and briefly.",
+    "es": "Live video call subtitle. Transcribe natural Spanish speech accurately and briefly.",
+    "zh": "Live video call subtitle. Transcribe natural Chinese speech accurately and briefly.",
+    "ka": "Live video call subtitle. Transcribe natural Georgian speech accurately and briefly.",
 }
 
 
@@ -183,22 +224,22 @@ class AudioTranslationSession:
             await self._maybe_start_partial(now)
             return
 
-        if self.in_speech and now - self.last_voice_at >= FINAL_SILENCE_SECONDS:
+        if self.in_speech and now - self.last_voice_at >= WHISPER_RUNTIME.final_silence_seconds:
             await self._start_final()
 
     async def close(self) -> None:
         await self._start_final()
 
     async def _maybe_start_partial(self, now: float) -> None:
-        min_bytes = int(self.config.bytes_per_second * MIN_TRANSCRIBE_SECONDS)
+        min_bytes = int(self.config.bytes_per_second * WHISPER_RUNTIME.min_transcribe_seconds)
         if len(self.audio_buffer) < min_bytes:
             return
-        if now - self.last_partial_at < PARTIAL_TRANSCRIBE_INTERVAL_SECONDS:
+        if now - self.last_partial_at < WHISPER_RUNTIME.partial_interval_seconds:
             return
         if self.partial_task is not None and not self.partial_task.done():
             return
 
-        rolling_bytes = int(self.config.bytes_per_second * ROLLING_TRANSCRIBE_WINDOW_SECONDS)
+        rolling_bytes = int(self.config.bytes_per_second * WHISPER_RUNTIME.rolling_window_seconds)
         pcm = bytes(self.audio_buffer[-rolling_bytes:])
         self.last_partial_at = now
         self.partial_task = asyncio.create_task(
@@ -246,13 +287,14 @@ class AudioTranslationSession:
             translate_ms = int((time.perf_counter() - translate_started) * 1000)
             total_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
-                "modern_caption room=%s peer=%s final=%s bytes=%s stt_ms=%s translate_ms=%s total_ms=%s text_len=%s translated_len=%s",
+                "modern_caption room=%s peer=%s final=%s bytes=%s stt_ms=%s translate_ms=%s tts_ms=%s total_ms=%s text_len=%s translated_len=%s",
                 self.room,
                 self.peer_id,
                 is_final,
                 len(pcm),
                 stt_ms,
                 translate_ms,
+                0,
                 total_ms,
                 len(text),
                 len(translated),
@@ -267,6 +309,7 @@ class AudioTranslationSession:
                 "timing_ms": {
                     "stt": stt_ms,
                     "translation": translate_ms,
+                    "tts": 0,
                     "total": total_ms,
                 },
             }
@@ -291,7 +334,7 @@ def normalize_source_lang(lang: str) -> str:
 
 def normalize_target_lang(lang: str) -> str:
     if not lang:
-        return "RU"
+        return "EN-US"
     lang = lang.upper()
     if lang == "EN":
         return "EN-US"
@@ -306,8 +349,11 @@ def whisper_lang(lang: str) -> str:
         "EN": "en",
         "EN-US": "en",
         "DE": "de",
-        "FR": "fr",
+        "NL": "nl",
+        "AR": "ar",
         "ES": "es",
+        "ZH": "zh",
+        "KA": "ka",
     }
     return mapping.get(normalize_source_lang(lang), "en")
 
@@ -320,8 +366,11 @@ def google_lang(lang: str) -> str:
         "EN-US": "en",
         "EN": "en",
         "DE": "de",
-        "FR": "fr",
+        "NL": "nl",
+        "AR": "ar",
         "ES": "es",
+        "ZH": "zh-CN",
+        "KA": "ka",
     }
     return mapping.get(normalize_target_lang(lang), "en")
 
@@ -658,12 +707,12 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
 
         segments, _ = model.transcribe(
             stt_path,
-            beam_size=WHISPER_BEAM_SIZE,
+            beam_size=WHISPER_RUNTIME.beam_size,
             language=whisper_lang(source_lang),
-            vad_filter=WHISPER_VAD_FILTER,
+            vad_filter=WHISPER_RUNTIME.vad_filter,
             vad_parameters={
-                "min_silence_duration_ms": 260,
-                "speech_pad_ms": 160,
+                "min_silence_duration_ms": WHISPER_RUNTIME.vad_min_silence_ms,
+                "speech_pad_ms": WHISPER_RUNTIME.vad_speech_pad_ms,
             },
             initial_prompt=transcription_prompt(source_lang, previous_text),
             temperature=WHISPER_TEMPERATURE,
@@ -710,7 +759,7 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
         )
         retry_segments, _ = model.transcribe(
             stt_path,
-            beam_size=max(1, min(WHISPER_BEAM_SIZE, 2)),
+            beam_size=max(1, min(WHISPER_RUNTIME.beam_size, 2)),
             language=whisper_lang(source_lang),
             vad_filter=False,
             initial_prompt=transcription_prompt(source_lang, previous_text),
@@ -782,6 +831,8 @@ async def health() -> dict[str, Any]:
         "rolling_transcribe_window_seconds": ROLLING_TRANSCRIBE_WINDOW_SECONDS,
         "final_silence_seconds": FINAL_SILENCE_SECONDS,
         "min_transcribe_seconds": MIN_TRANSCRIBE_SECONDS,
+        "stt_vad_min_silence_ms": WHISPER_RUNTIME.vad_min_silence_ms,
+        "stt_vad_speech_pad_ms": WHISPER_RUNTIME.vad_speech_pad_ms,
         "vad_rms_threshold": VAD_RMS_THRESHOLD,
         "stt_hard_silence_rms": STT_HARD_SILENCE_RMS,
         "stt_target_rms": STT_TARGET_RMS,
@@ -1031,9 +1082,11 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
                         },
                     )
                     continue
+                temp_write_started = time.perf_counter()
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as file:
                     file.write(audio_bytes)
                     temp_path = file.name
+                temp_write_ms = int((time.perf_counter() - temp_write_started) * 1000)
                 try:
                     stt_started = time.perf_counter()
                     text = await transcribe_wav(temp_path, source_lang, previous_text or client_previous_text)
@@ -1060,7 +1113,13 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
                             "audioBytes": len(audio_bytes),
                             "format": "pcm16wav",
                             "sampleRate": 16000,
-                            "timingMs": {"decode": decode_ms, "stt": stt_ms, "total": total_ms},
+                            "timingMs": {
+                                "decode": decode_ms,
+                                "tempWrite": temp_write_ms,
+                                "stt": stt_ms,
+                                "tts": 0,
+                                "total": total_ms,
+                            },
                         },
                     )
                     continue
@@ -1070,12 +1129,14 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
                 total_ms = int((time.perf_counter() - request_started) * 1000)
                 previous_text = clean_transcript(f"{previous_text} {text}")[-500:]
                 logger.info(
-                    "legacy_caption bytes=%s source=%s target=%s stt_ms=%s translate_ms=%s total_ms=%s text_len=%s translated_len=%s",
+                    "legacy_caption bytes=%s source=%s target=%s temp_write_ms=%s stt_ms=%s translate_ms=%s tts_ms=%s total_ms=%s text_len=%s translated_len=%s",
                     len(audio_bytes),
                     source_lang,
                     target_lang,
+                    temp_write_ms,
                     stt_ms,
                     translate_ms,
+                    0,
                     total_ms,
                     len(text),
                     len(translated),
@@ -1093,8 +1154,10 @@ async def legacy_translate_socket(websocket: WebSocket) -> None:
                         "sampleRate": 16000,
                         "timingMs": {
                             "decode": decode_ms,
+                            "tempWrite": temp_write_ms,
                             "stt": stt_ms,
                             "translation": translate_ms,
+                            "tts": 0,
                             "total": total_ms,
                         },
                     },
