@@ -13,12 +13,12 @@ from typing import Any
 from uuid import uuid4
 
 import deepl
+import httpx
 import uvicorn
 from deep_translator import GoogleTranslator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from faster_whisper import WhisperModel
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bridgecall.voice")
@@ -35,6 +35,9 @@ app.add_middleware(
 PORT = int(os.getenv("PORT", "8000"))
 DEEPL_AUTH_KEY = os.getenv("DEEPL_API_KEY") or os.getenv("DEEPL_AUTH_KEY", "")
 DEEPL_API_URL = os.getenv("DEEPL_API_URL", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
+GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE") or os.getenv("WHISPER_MODEL", "small")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
@@ -91,11 +94,6 @@ WHISPER_RUNTIME = WhisperRuntimeConfig(
     vad_speech_pad_ms=STT_VAD_SPEECH_PAD_MS,
 )
 
-model = WhisperModel(
-    WHISPER_RUNTIME.model_size,
-    device=os.getenv("WHISPER_DEVICE", "cpu"),
-    compute_type=WHISPER_RUNTIME.compute_type,
-)
 translation_cache: dict[tuple[str, str, str], str] = {}
 
 legacy_client_info: dict[WebSocket, dict[str, Any]] = {}
@@ -122,6 +120,19 @@ TRANSCRIPTION_PROMPTS = {
     "es": "Live video call subtitle. Transcribe natural Spanish speech accurately and briefly.",
     "zh": "Live video call subtitle. Transcribe natural Chinese speech accurately and briefly.",
     "ka": "Live video call subtitle. Transcribe natural Georgian speech accurately and briefly.",
+}
+
+GROQ_LANGUAGE_MAP = {
+    "tr": "tr",
+    "en": "en",
+    "ru": "ru",
+    "de": "de",
+    "nl": "nl",
+    "uk": "uk",
+    "ar": "ar",
+    "es": "es",
+    "zh": "zh",
+    "ka": "ka",
 }
 
 
@@ -635,166 +646,54 @@ async def transcribe_pcm(pcm: bytes, config: TranslationConfig) -> str:
 
 
 async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -> str:
-    loop = asyncio.get_running_loop()
+    if not GROQ_API_KEY:
+        logger.error("GROQ_API_KEY eksik!")
+        return ""
 
-    def run_transcribe() -> str:
-        stt_path, audio_rms, gain, trimmed_ms = normalize_wav_for_stt(path)
-        if gain > 1.0 or trimmed_ms > 0:
-            logger.info(
-                "stt_audio_prepared source=%s original_rms=%s gain=%s trimmed_ms=%s",
-                source_lang,
-                audio_rms,
-                gain,
-                trimmed_ms,
-            )
+    groq_lang = GROQ_LANGUAGE_MAP.get(source_lang.lower(), source_lang.lower())
 
-        def cleanup_stt_path() -> None:
-            if stt_path != path:
-                try:
-                    os.remove(stt_path)
-                except OSError:
-                    pass
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            with open(path, "rb") as f:
+                audio_data = f.read()
 
-        use_fast_relaxed = gain >= STT_FAST_GAIN_THRESHOLD or (
-            STT_HARD_SILENCE_RMS <= audio_rms < VAD_RMS_THRESHOLD
-        )
-        if use_fast_relaxed:
-            logger.info(
-                "stt_fast_relaxed_start source=%s rms=%s gain=%s trimmed_ms=%s",
-                source_lang,
-                audio_rms,
-                gain,
-                trimmed_ms,
-            )
-            fast_segments, _ = model.transcribe(
-                stt_path,
-                beam_size=1,
-                language=whisper_lang(source_lang),
-                vad_filter=False,
-                initial_prompt=transcription_prompt(source_lang, previous_text),
-                temperature=0.0,
-                no_speech_threshold=0.94,
-                log_prob_threshold=-1.25,
-                compression_ratio_threshold=3.2,
-                condition_on_previous_text=False,
-            )
-            fast_list = list(fast_segments)
-            fast_text, fast_confidence = stable_segment_text(fast_list, relaxed=True)
-            if is_low_value_transcript(fast_text):
-                logger.info(
-                    "stt_fast_relaxed_low_value source=%s rms=%s gain=%s trimmed_ms=%s segments=%s text=%r",
-                    source_lang,
-                    audio_rms,
-                    gain,
-                    trimmed_ms,
-                    len(fast_list),
-                    fast_text,
-                )
-                cleanup_stt_path()
+            if len(audio_data) < 8000:
                 return ""
-            logger.info(
-                "stt_fast_relaxed_result source=%s rms=%s gain=%s trimmed_ms=%s confidence=%s segments=%s text_len=%s",
-                source_lang,
-                audio_rms,
-                gain,
-                trimmed_ms,
-                fast_confidence,
-                len(fast_list),
-                len(fast_text),
-            )
-            cleanup_stt_path()
-            return fast_text
 
-        segments, _ = model.transcribe(
-            stt_path,
-            beam_size=WHISPER_RUNTIME.beam_size,
-            language=whisper_lang(source_lang),
-            vad_filter=WHISPER_RUNTIME.vad_filter,
-            vad_parameters={
-                "min_silence_duration_ms": WHISPER_RUNTIME.vad_min_silence_ms,
-                "speech_pad_ms": WHISPER_RUNTIME.vad_speech_pad_ms,
-            },
-            initial_prompt=transcription_prompt(source_lang, previous_text),
-            temperature=WHISPER_TEMPERATURE,
-            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-            log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-            compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-            condition_on_previous_text=False,
-        )
-        segment_list = list(segments)
-        text, confidence = stable_segment_text(segment_list)
-        if is_low_value_transcript(text):
-            text = ""
-        if text:
-            logger.info(
-                "stt_primary_ok source=%s rms=%s trimmed_ms=%s confidence=%s segments=%s text_len=%s",
-                source_lang,
-                audio_rms,
-                trimmed_ms,
-                confidence,
-                len(segment_list),
-                len(text),
+            files = {"file": ("audio.wav", audio_data, "audio/wav")}
+            data = {
+                "model": GROQ_STT_MODEL,
+                "language": groq_lang,
+                "response_format": "json",
+                "temperature": "0",
+            }
+            if previous_text:
+                data["prompt"] = previous_text[:200]
+
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+
+            response = await client.post(
+                GROQ_STT_URL,
+                headers=headers,
+                files=files,
+                data=data,
             )
-            cleanup_stt_path()
+            response.raise_for_status()
+
+            text = response.json().get("text", "").strip()
+            LOW_VALUE = {"", ".", "...", "thanks for watching", "altyazi m.k.", "abone olmayi unutmayin"}
+            if text.lower() in LOW_VALUE:
+                return ""
+
+            logger.info("groq_stt_ok lang=%s text=%r", groq_lang, text[:50])
             return text
 
-        if audio_rms < STT_HARD_SILENCE_RMS and gain <= 1.0:
-            logger.info(
-                "stt_primary_no_speech_hard_silence source=%s rms=%s trimmed_ms=%s segments=%s",
-                source_lang,
-                audio_rms,
-                trimmed_ms,
-                len(segment_list),
-            )
-            cleanup_stt_path()
-            return ""
-
-        logger.info(
-            "stt_primary_empty_retry_relaxed source=%s rms=%s gain=%s trimmed_ms=%s segments=%s",
-            source_lang,
-            audio_rms,
-            gain,
-            trimmed_ms,
-            len(segment_list),
-        )
-        retry_segments, _ = model.transcribe(
-            stt_path,
-            beam_size=max(1, min(WHISPER_RUNTIME.beam_size, 2)),
-            language=whisper_lang(source_lang),
-            vad_filter=False,
-            initial_prompt=transcription_prompt(source_lang, previous_text),
-            temperature=0.2,
-            no_speech_threshold=0.92,
-            log_prob_threshold=-1.15,
-            compression_ratio_threshold=3.2,
-            condition_on_previous_text=False,
-        )
-        retry_list = list(retry_segments)
-        retry_text, retry_confidence = stable_segment_text(retry_list, relaxed=True)
-        if is_low_value_transcript(retry_text):
-            logger.info(
-                "stt_relaxed_low_value source=%s rms=%s trimmed_ms=%s segments=%s text=%r",
-                source_lang,
-                audio_rms,
-                trimmed_ms,
-                len(retry_list),
-                retry_text,
-            )
-            cleanup_stt_path()
-            return ""
-        logger.info(
-            "stt_relaxed_result source=%s rms=%s trimmed_ms=%s confidence=%s segments=%s text_len=%s",
-            source_lang,
-            audio_rms,
-            trimmed_ms,
-            retry_confidence,
-            len(retry_list),
-            len(retry_text),
-        )
-        cleanup_stt_path()
-        return retry_text
-
-    return await loop.run_in_executor(None, run_transcribe)
+    except httpx.TimeoutException:
+        logger.warning("groq_stt_timeout lang=%s", groq_lang)
+        return ""
+    except Exception as e:
+        logger.error("groq_stt_exception %s", e)
+        return ""
 
 
 @app.get("/")
