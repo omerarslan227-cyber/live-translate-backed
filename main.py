@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import struct
 import tempfile
 import time
@@ -19,6 +21,11 @@ from deep_translator import GoogleTranslator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+try:
+    import redis.asyncio as redis
+except Exception:  # pragma: no cover - optional production dependency
+    redis = None
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bridgecall.voice")
@@ -63,6 +70,13 @@ STT_TRIM_FRAME_MS = int(os.getenv("STT_TRIM_FRAME_MS", "20"))
 STT_TRIM_PAD_MS = int(os.getenv("STT_TRIM_PAD_MS", "120"))
 STT_VAD_MIN_SILENCE_MS = int(os.getenv("STT_VAD_MIN_SILENCE_MS", "220"))
 STT_VAD_SPEECH_PAD_MS = int(os.getenv("STT_VAD_SPEECH_PAD_MS", "120"))
+REDIS_URL = os.getenv("REDIS_URL", "")
+ROOM_CODE_LENGTH = int(os.getenv("ROOM_CODE_LENGTH", "8"))
+ROOM_TTL_SECONDS = int(os.getenv("ROOM_TTL_SECONDS", "7200"))
+JOIN_ATTEMPT_LIMIT = int(os.getenv("JOIN_ATTEMPT_LIMIT", "5"))
+JOIN_ATTEMPT_WINDOW_SECONDS = int(os.getenv("JOIN_ATTEMPT_WINDOW_SECONDS", "300"))
+JOIN_COOLDOWN_SECONDS = int(os.getenv("JOIN_COOLDOWN_SECONDS", "60"))
+ROOM_CODE_RE = re.compile(rf"^[A-Za-z0-9]{{{ROOM_CODE_LENGTH},}}$")
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
 
@@ -98,6 +112,13 @@ translation_cache: dict[tuple[str, str, str], str] = {}
 
 legacy_client_info: dict[WebSocket, dict[str, Any]] = {}
 legacy_signal_rooms: dict[str, dict[str, Any]] = {}
+legacy_join_attempts: dict[str, list[float]] = {}
+legacy_join_cooldowns: dict[str, float] = {}
+redis_client = (
+    redis.from_url(REDIS_URL, decode_responses=True)
+    if redis is not None and REDIS_URL
+    else None
+)
 
 LOW_VALUE_TRANSCRIPTS = {
     "",
@@ -467,6 +488,96 @@ async def safe_send(websocket: WebSocket, payload: dict[str, Any]) -> None:
         pass
 
 
+def is_valid_room_code(code: Any) -> bool:
+    return isinstance(code, str) and bool(ROOM_CODE_RE.fullmatch(code.strip()))
+
+
+def client_fingerprint(websocket: WebSocket) -> str:
+    forwarded = websocket.headers.get("x-forwarded-for", "")
+    client_host = websocket.client.host if websocket.client else "unknown"
+    raw = f"{forwarded.split(',')[0].strip() or client_host}:{websocket.headers.get('user-agent', '')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def join_attempt_key(websocket: WebSocket, room_id: str) -> str:
+    return f"join:{room_id}:{client_fingerprint(websocket)}"
+
+
+async def join_is_limited(websocket: WebSocket, room_id: str) -> tuple[bool, int]:
+    key = join_attempt_key(websocket, room_id)
+    cooldown_key = f"{key}:cooldown"
+    now = time.time()
+    if redis_client is not None:
+        cooldown_until = await redis_client.get(cooldown_key)
+        if cooldown_until and float(cooldown_until) > now:
+            return True, max(1, int(float(cooldown_until) - now))
+        count = int(await redis_client.get(key) or "0")
+        return count >= JOIN_ATTEMPT_LIMIT, JOIN_COOLDOWN_SECONDS
+
+    cooldown_until = legacy_join_cooldowns.get(key, 0)
+    if cooldown_until > now:
+        return True, max(1, int(cooldown_until - now))
+    window_start = now - JOIN_ATTEMPT_WINDOW_SECONDS
+    attempts = [item for item in legacy_join_attempts.get(key, []) if item >= window_start]
+    legacy_join_attempts[key] = attempts
+    return len(attempts) >= JOIN_ATTEMPT_LIMIT, JOIN_COOLDOWN_SECONDS
+
+
+async def record_failed_join(websocket: WebSocket, room_id: str) -> int:
+    key = join_attempt_key(websocket, room_id)
+    cooldown_key = f"{key}:cooldown"
+    now = time.time()
+    if redis_client is not None:
+        count = await redis_client.incr(key)
+        await redis_client.expire(key, JOIN_ATTEMPT_WINDOW_SECONDS)
+        if int(count) >= JOIN_ATTEMPT_LIMIT:
+            cooldown_until = now + JOIN_COOLDOWN_SECONDS
+            await redis_client.setex(cooldown_key, JOIN_COOLDOWN_SECONDS, str(cooldown_until))
+        return int(count)
+
+    attempts = legacy_join_attempts.setdefault(key, [])
+    attempts.append(now)
+    legacy_join_attempts[key] = [
+        item for item in attempts if item >= now - JOIN_ATTEMPT_WINDOW_SECONDS
+    ]
+    if len(legacy_join_attempts[key]) >= JOIN_ATTEMPT_LIMIT:
+        legacy_join_cooldowns[key] = now + JOIN_COOLDOWN_SECONDS
+    return len(legacy_join_attempts[key])
+
+
+async def clear_join_attempts(websocket: WebSocket, room_id: str) -> None:
+    key = join_attempt_key(websocket, room_id)
+    if redis_client is not None:
+        await redis_client.delete(key, f"{key}:cooldown")
+        return
+    legacy_join_attempts.pop(key, None)
+    legacy_join_cooldowns.pop(key, None)
+
+
+async def reject_join_attempt(websocket: WebSocket, room_id: str) -> None:
+    attempts = await record_failed_join(websocket, room_id)
+    logger.warning("legacy_join_rejected room=%s attempts=%s", room_id, attempts)
+    await safe_send(
+        websocket,
+        {
+            "type": "error",
+            "message": "Oda bulunamadi veya kod hatali",
+        },
+    )
+
+
+def cleanup_expired_legacy_rooms() -> None:
+    now = time.time()
+    expired = [
+        room_id
+        for room_id, room in legacy_signal_rooms.items()
+        if float(room.get("expiresAt", 0)) <= now
+    ]
+    for room_id in expired:
+        logger.info("legacy_room_expired room=%s", room_id)
+        legacy_signal_rooms.pop(room_id, None)
+
+
 def room_payload(room_id: str) -> dict[str, Any]:
     room = legacy_signal_rooms[room_id]
     return {
@@ -475,6 +586,7 @@ def room_payload(room_id: str) -> dict[str, Any]:
         "capacity": room["capacity"],
         "memberCount": len(room["members"]),
         "privateCode": room["privateCode"],
+        "expiresAt": room.get("expiresAt"),
     }
 
 
@@ -739,6 +851,12 @@ async def health() -> dict[str, Any]:
         "stt_trim_frame_ms": STT_TRIM_FRAME_MS,
         "stt_trim_pad_ms": STT_TRIM_PAD_MS,
         "deepl_configured": bool(DEEPL_AUTH_KEY),
+        "redis_configured": redis_client is not None,
+        "room_code_length": ROOM_CODE_LENGTH,
+        "room_ttl_seconds": ROOM_TTL_SECONDS,
+        "join_attempt_limit": JOIN_ATTEMPT_LIMIT,
+        "join_attempt_window_seconds": JOIN_ATTEMPT_WINDOW_SECONDS,
+        "join_cooldown_seconds": JOIN_COOLDOWN_SECONDS,
     }
 
 
@@ -804,6 +922,7 @@ async def legacy_signal_socket(websocket: WebSocket) -> None:
         await safe_send(websocket, {"type": "welcome", "clientId": client_id})
 
         while True:
+            cleanup_expired_legacy_rooms()
             raw = await websocket.receive_text()
             data = json.loads(raw)
             msg_type = data.get("type")
@@ -816,6 +935,15 @@ async def legacy_signal_socket(websocket: WebSocket) -> None:
                 if not room_id or not private_code:
                     await safe_send(websocket, {"type": "error", "message": "room ve privateCode gerekli"})
                     continue
+                if not is_valid_room_code(private_code):
+                    await safe_send(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": f"Oda kodu en az {ROOM_CODE_LENGTH} alphanumeric karakter olmali",
+                        },
+                    )
+                    continue
                 if room_id in legacy_signal_rooms:
                     await safe_send(websocket, {"type": "error", "message": "Bu oda zaten var"})
                     continue
@@ -827,6 +955,7 @@ async def legacy_signal_socket(websocket: WebSocket) -> None:
                     "pending": {},
                     "capacity": capacity,
                     "privateCode": private_code,
+                    "expiresAt": time.time() + ROOM_TTL_SECONDS,
                 }
                 legacy_client_info[websocket]["room"] = room_id
                 await safe_send(websocket, {"type": "room_created", **room_payload(room_id)})
@@ -836,16 +965,31 @@ async def legacy_signal_socket(websocket: WebSocket) -> None:
             if msg_type == "request_join":
                 room_id = data.get("room")
                 private_code = data.get("privateCode")
+                if not room_id or not is_valid_room_code(private_code):
+                    await reject_join_attempt(websocket, str(room_id or "missing"))
+                    continue
+                limited, retry_after = await join_is_limited(websocket, room_id)
+                if limited:
+                    await safe_send(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": f"Cok fazla deneme. {retry_after} saniye sonra tekrar dene.",
+                            "retryAfterSeconds": retry_after,
+                        },
+                    )
+                    continue
                 if room_id not in legacy_signal_rooms:
-                    await safe_send(websocket, {"type": "error", "message": "Oda bulunamadi"})
+                    await reject_join_attempt(websocket, room_id)
                     continue
                 room = legacy_signal_rooms[room_id]
                 if room["privateCode"] != private_code:
-                    await safe_send(websocket, {"type": "error", "message": "Oda kodu yanlis"})
+                    await reject_join_attempt(websocket, room_id)
                     continue
                 if len(room["members"]) >= room["capacity"]:
                     await safe_send(websocket, {"type": "error", "message": "Oda dolu"})
                     continue
+                await clear_join_attempts(websocket, room_id)
                 room["pending"][client_id] = websocket
                 await safe_send(room["owner"], {"type": "join_request", "room": room_id, "requesterId": client_id})
                 continue
