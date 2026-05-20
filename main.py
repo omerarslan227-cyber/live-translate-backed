@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import math
@@ -71,16 +72,18 @@ STT_TRIM_FRAME_MS = int(os.getenv("STT_TRIM_FRAME_MS", "20"))
 STT_TRIM_PAD_MS = int(os.getenv("STT_TRIM_PAD_MS", "120"))
 STT_VAD_MIN_SILENCE_MS = int(os.getenv("STT_VAD_MIN_SILENCE_MS", "220"))
 STT_VAD_SPEECH_PAD_MS = int(os.getenv("STT_VAD_SPEECH_PAD_MS", "120"))
-STT_MIN_AUDIO_SECONDS = float(os.getenv("STT_MIN_AUDIO_SECONDS", "0.45"))
+STT_MIN_AUDIO_SECONDS = float(os.getenv("STT_MIN_AUDIO_SECONDS", "0.2"))
 STT_MIN_RMS = int(os.getenv("STT_MIN_RMS", "90"))
 STT_MIN_ACTIVE_RATIO = float(os.getenv("STT_MIN_ACTIVE_RATIO", "0.08"))
 STT_REPEAT_WINDOW_SECONDS = float(os.getenv("STT_REPEAT_WINDOW_SECONDS", "4.0"))
-REALTIME_CHUNK_MIN_SECONDS = float(os.getenv("REALTIME_CHUNK_MIN_SECONDS", "1.0"))
-REALTIME_CHUNK_TARGET_SECONDS = float(os.getenv("REALTIME_CHUNK_TARGET_SECONDS", "1.25"))
-REALTIME_CHUNK_MAX_SECONDS = float(os.getenv("REALTIME_CHUNK_MAX_SECONDS", "2.0"))
-REALTIME_MAX_BUFFER_SECONDS = float(os.getenv("REALTIME_MAX_BUFFER_SECONDS", "2.5"))
-REALTIME_MAX_QUEUE_SIZE = int(os.getenv("REALTIME_MAX_QUEUE_SIZE", "1"))
-REALTIME_STT_TIMEOUT_SECONDS = float(os.getenv("REALTIME_STT_TIMEOUT_SECONDS", "2.0"))
+REALTIME_CHUNK_MIN_SECONDS = float(os.getenv("REALTIME_CHUNK_MIN_SECONDS", "0.2"))
+REALTIME_CHUNK_TARGET_SECONDS = float(os.getenv("REALTIME_CHUNK_TARGET_SECONDS", "0.32"))
+REALTIME_CHUNK_MAX_SECONDS = float(os.getenv("REALTIME_CHUNK_MAX_SECONDS", "0.4"))
+REALTIME_MAX_BUFFER_SECONDS = float(os.getenv("REALTIME_MAX_BUFFER_SECONDS", "0.8"))
+REALTIME_MAX_QUEUE_SIZE = int(os.getenv("REALTIME_MAX_QUEUE_SIZE", "2"))
+REALTIME_STT_TIMEOUT_SECONDS = float(os.getenv("REALTIME_STT_TIMEOUT_SECONDS", "1.1"))
+REALTIME_TRANSLATE_TIMEOUT_SECONDS = float(os.getenv("REALTIME_TRANSLATE_TIMEOUT_SECONDS", "0.5"))
+REALTIME_RESULT_MAX_AGE_SECONDS = float(os.getenv("REALTIME_RESULT_MAX_AGE_SECONDS", "0.85"))
 REDIS_URL = os.getenv("REDIS_URL", "")
 ROOM_CODE_LENGTH = int(os.getenv("ROOM_CODE_LENGTH", "8"))
 ROOM_TTL_SECONDS = int(os.getenv("ROOM_TTL_SECONDS", "7200"))
@@ -150,16 +153,16 @@ LOW_VALUE_TRANSCRIPTS = {
 }
 
 TRANSCRIPTION_PROMPTS = {
-    "tr": "Bu ses Türkçe konuşmadır. Kısa cümleleri doğal Türkçe olarak yaz.",
-    "ru": "Live video call subtitle. Transcribe natural Russian speech accurately and briefly.",
-    "uk": "Live video call subtitle. Transcribe natural Ukrainian speech accurately and briefly.",
-    "en": "Live video call subtitle. Transcribe natural English speech accurately and briefly.",
-    "de": "Live video call subtitle. Transcribe natural German speech accurately and briefly.",
-    "nl": "Live video call subtitle. Transcribe natural Dutch speech accurately and briefly.",
-    "ar": "Live video call subtitle. Transcribe natural Arabic speech accurately and briefly.",
-    "es": "Live video call subtitle. Transcribe natural Spanish speech accurately and briefly.",
-    "zh": "Live video call subtitle. Transcribe natural Chinese speech accurately and briefly.",
-    "ka": "Live video call subtitle. Transcribe natural Georgian speech accurately and briefly.",
+    "tr": "Transcribe this speech naturally and accurately in the selected source language.",
+    "ru": "Transcribe this speech naturally and accurately in the selected source language.",
+    "uk": "Transcribe this speech naturally and accurately in the selected source language.",
+    "en": "Transcribe this speech naturally and accurately in the selected source language.",
+    "de": "Transcribe this speech naturally and accurately in the selected source language.",
+    "nl": "Transcribe this speech naturally and accurately in the selected source language.",
+    "ar": "Transcribe this speech naturally and accurately in the selected source language.",
+    "es": "Transcribe this speech naturally and accurately in the selected source language.",
+    "zh": "Transcribe this speech naturally and accurately in the selected source language.",
+    "ka": "Transcribe this speech naturally and accurately in the selected source language.",
 }
 
 GROQ_LANGUAGE_MAP = {
@@ -423,14 +426,19 @@ class AudioTranslationSession:
             )
         )
         logger.info(
-            "modern_chunk_queued room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s",
+            "modern_chunk_queued room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
             self.room,
             self.peer_id,
-            stats.duration_seconds,
+            int(stats.duration_seconds * 1000),
             stats.rms,
             stats.silence_ratio,
             len(self.chunk_queue),
             0,
+            0,
+            0,
+            False,
+            self.config.source_language,
+            self.config.target_language,
         )
         self._ensure_processor()
 
@@ -441,16 +449,19 @@ class AudioTranslationSession:
     async def _process_queue(self) -> None:
         while self.chunk_queue and not self.closed:
             chunk = self.chunk_queue.popleft()
-            if time.monotonic() - chunk.created_at > REALTIME_STT_TIMEOUT_SECONDS:
+            if time.monotonic() - chunk.created_at > REALTIME_RESULT_MAX_AGE_SECONDS:
                 logger.info(
-                    "modern_stale_chunk_discard room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s",
+                    "modern_stale_chunk_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
                     self.room,
                     self.peer_id,
-                    chunk.stats.duration_seconds,
+                    int(chunk.stats.duration_seconds * 1000),
                     chunk.stats.rms,
                     chunk.stats.silence_ratio,
                     len(self.chunk_queue),
                     0,
+                    True,
+                    self.config.source_language,
+                    self.config.target_language,
                 )
                 continue
             await self._process(chunk)
@@ -466,27 +477,37 @@ class AudioTranslationSession:
             except asyncio.TimeoutError:
                 stt_ms = int((time.perf_counter() - started) * 1000)
                 logger.info(
-                    "modern_stt_timeout_discard room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s",
+                    "modern_stt_timeout_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
                     self.room,
                     self.peer_id,
-                    chunk.stats.duration_seconds,
+                    int(chunk.stats.duration_seconds * 1000),
                     chunk.stats.rms,
                     chunk.stats.silence_ratio,
                     len(self.chunk_queue),
                     stt_ms,
+                    0,
+                    stt_ms,
+                    True,
+                    self.config.source_language,
+                    self.config.target_language,
                 )
                 return
             stt_ms = int((time.perf_counter() - started) * 1000)
             if not text:
                 logger.info(
-                    "modern_stt_no_speech room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s",
+                    "modern_stt_no_speech room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
                     self.room,
                     self.peer_id,
-                    chunk.stats.duration_seconds,
+                    int(chunk.stats.duration_seconds * 1000),
                     chunk.stats.rms,
                     chunk.stats.silence_ratio,
                     len(self.chunk_queue),
                     stt_ms,
+                    0,
+                    stt_ms,
+                    False,
+                    self.config.source_language,
+                    self.config.target_language,
                 )
                 return
             if chunk.generation != self.generation:
@@ -508,16 +529,54 @@ class AudioTranslationSession:
             self.last_caption_text = transcript_key(text)
             self.last_caption_at = now
             self.last_chunk_hash = chunk.chunk_hash
+            if time.monotonic() - chunk.created_at > REALTIME_RESULT_MAX_AGE_SECONDS:
+                total_ms = int((time.perf_counter() - started) * 1000)
+                logger.info(
+                    "modern_old_stt_result_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s stt_text=%r",
+                    self.room,
+                    self.peer_id,
+                    int(chunk.stats.duration_seconds * 1000),
+                    chunk.stats.rms,
+                    chunk.stats.silence_ratio,
+                    len(self.chunk_queue),
+                    stt_ms,
+                    0,
+                    total_ms,
+                    True,
+                    self.config.source_language,
+                    self.config.target_language,
+                    text[:80],
+                )
+                return
+
             translate_started = time.perf_counter()
-            translated = translate_text_value(text, self.config.source_language, self.config.target_language)
+            translated = await translate_text_fast(text, self.config.source_language, self.config.target_language)
             translate_ms = int((time.perf_counter() - translate_started) * 1000)
             total_ms = int((time.perf_counter() - started) * 1000)
+            if not translated or total_ms > int(REALTIME_RESULT_MAX_AGE_SECONDS * 1000):
+                logger.info(
+                    "modern_translation_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s stt_text=%r",
+                    self.room,
+                    self.peer_id,
+                    int(chunk.stats.duration_seconds * 1000),
+                    chunk.stats.rms,
+                    chunk.stats.silence_ratio,
+                    len(self.chunk_queue),
+                    stt_ms,
+                    translate_ms,
+                    total_ms,
+                    total_ms > int(REALTIME_RESULT_MAX_AGE_SECONDS * 1000),
+                    self.config.source_language,
+                    self.config.target_language,
+                    text[:80],
+                )
+                return
             logger.info(
-                "modern_caption room=%s peer=%s final=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s tts_ms=%s total_ms=%s text_len=%s translated_len=%s stt_text=%r",
+                "modern_caption room=%s peer=%s final=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s tts_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s text_len=%s translated_len=%s stt_text=%r",
                 self.room,
                 self.peer_id,
                 True,
-                chunk.stats.duration_seconds,
+                int(chunk.stats.duration_seconds * 1000),
                 chunk.stats.rms,
                 chunk.stats.silence_ratio,
                 len(self.chunk_queue),
@@ -525,6 +584,9 @@ class AudioTranslationSession:
                 translate_ms,
                 0,
                 total_ms,
+                False,
+                self.config.source_language,
+                self.config.target_language,
                 len(text),
                 len(translated),
                 text[:80],
@@ -566,6 +628,8 @@ def normalize_source_lang(lang: str) -> str:
     if not lang:
         return "TR"
     lang = lang.upper()
+    if lang == "AUTO":
+        return "AUTO"
     if lang == "EN-US":
         return "EN"
     return lang
@@ -581,6 +645,8 @@ def normalize_target_lang(lang: str) -> str:
 
 
 def whisper_lang(lang: str) -> str:
+    if normalize_source_lang(lang) == "AUTO":
+        return "auto"
     mapping = {
         "TR": "tr",
         "RU": "ru",
@@ -711,6 +777,26 @@ def translate_text_value(text: str, source_lang: str, target_lang: str) -> str:
         translation_cache.clear()
     translation_cache[cache_key] = translated
     return translated
+
+
+async def translate_text_fast(text: str, source_lang: str, target_lang: str) -> str:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(translate_text_value, text, source_lang, target_lang),
+            timeout=REALTIME_TRANSLATE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "translate_timeout source=%s target=%s timeout_ms=%s text_len=%s",
+            source_lang,
+            target_lang,
+            int(REALTIME_TRANSLATE_TIMEOUT_SECONDS * 1000),
+            len(text),
+        )
+        return ""
+    except Exception as exc:
+        logger.warning("translate_exception source=%s target=%s error=%s", source_lang, target_lang, exc)
+        return ""
 
 
 async def safe_send(websocket: WebSocket, payload: dict[str, Any]) -> None:
@@ -1033,15 +1119,127 @@ def write_wav(pcm: bytes, sample_rate: int, channels: int) -> str:
     return file.name
 
 
+def wav_bytes_from_pcm(pcm: bytes, sample_rate: int, channels: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(SAMPLE_WIDTH_BYTES)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def normalize_pcm_for_stt(pcm: bytes, sample_rate: int, channels: int) -> tuple[bytes, int, float, int]:
+    original_rms = pcm_rms(pcm)
+    if original_rms <= 0:
+        return pcm, original_rms, 1.0, 0
+
+    prepared_pcm, trimmed_ms = trim_pcm_for_stt(pcm, sample_rate, channels, original_rms)
+    prepared_rms = pcm_rms(prepared_pcm)
+    if prepared_rms >= STT_TARGET_RMS:
+        return prepared_pcm, original_rms, 1.0, trimmed_ms
+
+    gain = min(STT_MAX_GAIN, STT_TARGET_RMS / max(prepared_rms, 1))
+    if gain <= 1.05:
+        return prepared_pcm, original_rms, 1.0, trimmed_ms
+
+    return apply_gain_to_pcm(prepared_pcm, gain), original_rms, round(gain, 2), trimmed_ms
+
+
 async def transcribe_pcm(pcm: bytes, config: TranslationConfig) -> str:
-    wav_path = write_wav(pcm, config.sample_rate, config.channels)
+    return await transcribe_pcm_bytes(pcm, config)
+
+
+async def transcribe_pcm_bytes(pcm: bytes, config: TranslationConfig, previous_text: str = "") -> str:
+    if not GROQ_API_KEY:
+        logger.error("GROQ_API_KEY eksik!")
+        return ""
+
+    source_lang = normalize_source_lang(config.source_language)
+    groq_lang = whisper_lang(source_lang)
+    original_stats = pcm_audio_stats(pcm, config.sample_rate, config.channels)
+    if config.sample_rate != SAMPLE_RATE or config.channels != CHANNELS:
+        logger.info(
+            "groq_stt_bad_format lang=%s sample_rate=%s channels=%s chunk_ms=%s rms=%s silence_ratio=%.3f",
+            groq_lang,
+            config.sample_rate,
+            config.channels,
+            int(original_stats.duration_seconds * 1000),
+            original_stats.rms,
+            original_stats.silence_ratio,
+        )
+        return ""
+    if should_skip_audio_for_stt(original_stats):
+        logger.info(
+            "groq_stt_vad_skip lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f",
+            groq_lang,
+            int(original_stats.duration_seconds * 1000),
+            original_stats.rms,
+            original_stats.silence_ratio,
+        )
+        return ""
+
+    prepared_pcm, _original_rms, gain, trimmed_ms = normalize_pcm_for_stt(
+        pcm,
+        config.sample_rate,
+        config.channels,
+    )
+    prepared_stats = pcm_audio_stats(prepared_pcm, config.sample_rate, config.channels)
     try:
-        return await transcribe_wav(wav_path, config.source_language)
-    finally:
-        try:
-            os.remove(wav_path)
-        except OSError:
-            pass
+        async with httpx.AsyncClient(timeout=REALTIME_STT_TIMEOUT_SECONDS) as client:
+            files = {
+                "file": (
+                    "audio.wav",
+                    wav_bytes_from_pcm(prepared_pcm, config.sample_rate, config.channels),
+                    "audio/wav",
+                )
+            }
+            data = {
+                "model": GROQ_STT_MODEL,
+                "response_format": "json",
+                "temperature": "0",
+                "prompt": transcription_prompt(source_lang, previous_text),
+            }
+            if groq_lang != "auto":
+                data["language"] = groq_lang
+
+            response = await client.post(
+                GROQ_STT_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files=files,
+                data=data,
+            )
+            response.raise_for_status()
+            text = response.json().get("text", "").strip()
+            if is_low_value_transcript(text):
+                logger.info(
+                    "groq_stt_low_value lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f stt_text=%r",
+                    groq_lang,
+                    int(original_stats.duration_seconds * 1000),
+                    original_stats.rms,
+                    original_stats.silence_ratio,
+                    text[:80],
+                )
+                return ""
+            logger.info(
+                "groq_stt_ok lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f prepared_chunk_ms=%s prepared_rms=%s gain=%.2f trimmed_ms=%s stt_text=%r",
+                groq_lang,
+                int(original_stats.duration_seconds * 1000),
+                original_stats.rms,
+                original_stats.silence_ratio,
+                int(prepared_stats.duration_seconds * 1000),
+                prepared_stats.rms,
+                gain,
+                trimmed_ms,
+                text[:80],
+            )
+            return text
+    except httpx.TimeoutException:
+        logger.warning("groq_stt_timeout lang=%s", groq_lang)
+        return ""
+    except Exception as e:
+        logger.error("groq_stt_exception %s", e)
+        return ""
 
 
 async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -> str:
@@ -1086,10 +1284,11 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             files = {"file": ("audio.wav", audio_data, "audio/wav")}
             data = {
                 "model": GROQ_STT_MODEL,
-                "language": groq_lang,
                 "response_format": "json",
                 "temperature": "0",
             }
+            if groq_lang != "auto":
+                data["language"] = groq_lang
             data["prompt"] = transcription_prompt(source_lang, previous_text)
 
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -1231,6 +1430,9 @@ async def modern_translation_socket(websocket: WebSocket, room: str, peer_id: st
                         sample_rate=int(payload.get("sample_rate", config.sample_rate)),
                         channels=int(payload.get("channels", config.channels)),
                     )
+                    if payload.get("audio_format", "pcm16") != "pcm16":
+                        await websocket.send_json({"type": "error", "message": "audio_format must be pcm16"})
+                        continue
                     session.update_config(config)
                 elif payload.get("type") == "ping":
                     await websocket.send_json({"type": "pong"})
@@ -1239,7 +1441,7 @@ async def modern_translation_socket(websocket: WebSocket, room: str, peer_id: st
             chunk = message.get("bytes")
             if chunk:
                 await session.add_audio(chunk)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
         await session.close()
