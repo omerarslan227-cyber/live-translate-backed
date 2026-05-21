@@ -77,13 +77,20 @@ STT_MIN_RMS = int(os.getenv("STT_MIN_RMS", "90"))
 STT_MIN_ACTIVE_RATIO = float(os.getenv("STT_MIN_ACTIVE_RATIO", "0.08"))
 STT_REPEAT_WINDOW_SECONDS = float(os.getenv("STT_REPEAT_WINDOW_SECONDS", "4.0"))
 REALTIME_CHUNK_MIN_SECONDS = float(os.getenv("REALTIME_CHUNK_MIN_SECONDS", "0.2"))
-REALTIME_CHUNK_TARGET_SECONDS = float(os.getenv("REALTIME_CHUNK_TARGET_SECONDS", "0.32"))
-REALTIME_CHUNK_MAX_SECONDS = float(os.getenv("REALTIME_CHUNK_MAX_SECONDS", "0.4"))
-REALTIME_MAX_BUFFER_SECONDS = float(os.getenv("REALTIME_MAX_BUFFER_SECONDS", "0.8"))
+REALTIME_CHUNK_TARGET_SECONDS = float(os.getenv("REALTIME_CHUNK_TARGET_SECONDS", "0.45"))
+REALTIME_CHUNK_MAX_SECONDS = float(os.getenv("REALTIME_CHUNK_MAX_SECONDS", "0.55"))
+REALTIME_MAX_BUFFER_SECONDS = float(os.getenv("REALTIME_MAX_BUFFER_SECONDS", "3.2"))
 REALTIME_MAX_QUEUE_SIZE = int(os.getenv("REALTIME_MAX_QUEUE_SIZE", "2"))
 REALTIME_STT_TIMEOUT_SECONDS = float(os.getenv("REALTIME_STT_TIMEOUT_SECONDS", "1.1"))
 REALTIME_TRANSLATE_TIMEOUT_SECONDS = float(os.getenv("REALTIME_TRANSLATE_TIMEOUT_SECONDS", "0.5"))
-REALTIME_RESULT_MAX_AGE_SECONDS = float(os.getenv("REALTIME_RESULT_MAX_AGE_SECONDS", "0.85"))
+REALTIME_RESULT_MAX_AGE_SECONDS = float(os.getenv("REALTIME_RESULT_MAX_AGE_SECONDS", "1.2"))
+REALTIME_PARTIAL_MIN_SECONDS = float(os.getenv("REALTIME_PARTIAL_MIN_SECONDS", "0.7"))
+REALTIME_PARTIAL_INTERVAL_SECONDS = float(os.getenv("REALTIME_PARTIAL_INTERVAL_SECONDS", "0.65"))
+REALTIME_UTTERANCE_MIN_SECONDS = float(os.getenv("REALTIME_UTTERANCE_MIN_SECONDS", "1.2"))
+REALTIME_UTTERANCE_MAX_SECONDS = float(os.getenv("REALTIME_UTTERANCE_MAX_SECONDS", "3.0"))
+REALTIME_FINAL_SILENCE_SECONDS = float(os.getenv("REALTIME_FINAL_SILENCE_SECONDS", "0.65"))
+REALTIME_GAIN_TARGET_RMS = int(os.getenv("REALTIME_GAIN_TARGET_RMS", "1200"))
+REALTIME_MAX_GAIN = float(os.getenv("REALTIME_MAX_GAIN", "8.0"))
 REDIS_URL = os.getenv("REDIS_URL", "")
 ROOM_CODE_LENGTH = int(os.getenv("ROOM_CODE_LENGTH", "8"))
 ROOM_TTL_SECONDS = int(os.getenv("ROOM_TTL_SECONDS", "7200"))
@@ -209,6 +216,19 @@ class AudioChunk:
     chunk_hash: str
 
 
+@dataclass(frozen=True)
+class RealtimeAudioPrep:
+    pcm: bytes
+    raw_rms: int
+    normalized_rms: int
+    gain_applied: float
+    clipped: bool
+    silence_ratio: float
+    vad_decision: bool
+    noise_floor: float
+    vad_threshold: int
+
+
 class RoomManager:
     def __init__(self) -> None:
         self.signaling: dict[str, dict[str, WebSocket]] = {}
@@ -264,26 +284,32 @@ class AudioTranslationSession:
         self.peer_id = peer_id
         self.config = self._fixed_audio_config(config)
         self.audio_buffer = bytearray()
-        self.chunk_queue: deque[AudioChunk] = deque()
         self.last_voice_at = 0.0
+        self.utterance_started_at = 0.0
+        self.last_partial_at = 0.0
         self.last_caption_text = ""
         self.last_caption_at = 0.0
-        self.last_chunk_hash = ""
+        self.last_final_text = ""
+        self.last_partial_text = ""
         self.in_speech = False
         self.generation = 0
-        self.processing_task: asyncio.Task[None] | None = None
+        self.utterance_id = 0
+        self.partial_task: asyncio.Task[None] | None = None
+        self.final_task: asyncio.Task[None] | None = None
         self.closed = False
+        self.noise_floor = float(STT_MIN_RMS)
 
     def update_config(self, config: TranslationConfig) -> None:
         self.config = self._fixed_audio_config(config)
         self.audio_buffer.clear()
-        self.chunk_queue.clear()
         self.last_voice_at = 0.0
+        self.utterance_started_at = 0.0
+        self.last_partial_at = 0.0
         self.last_caption_text = ""
-        self.last_caption_at = 0.0
-        self.last_chunk_hash = ""
+        self.last_partial_text = ""
         self.in_speech = False
         self.generation += 1
+        self.utterance_id += 1
 
     def _fixed_audio_config(self, config: TranslationConfig) -> TranslationConfig:
         if config.sample_rate != SAMPLE_RATE or config.channels != CHANNELS:
@@ -306,323 +332,347 @@ class AudioTranslationSession:
     async def add_audio(self, chunk: bytes) -> None:
         if self.closed:
             return
-        chunk = clean_pcm(chunk)
-        if not chunk:
+        cleaned = clean_pcm(chunk)
+        if not cleaned:
             return
 
         now = time.monotonic()
-        chunk_stats = pcm_audio_stats(chunk, self.config.sample_rate, self.config.channels)
-        if chunk_stats.rms < STT_MIN_RMS or chunk_stats.silence_ratio >= 0.98:
-            logger.info(
-                "modern_audio_noise_skip room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s",
-                self.room,
-                self.peer_id,
-                chunk_stats.duration_seconds,
-                chunk_stats.rms,
-                chunk_stats.silence_ratio,
-                len(self.chunk_queue),
-            )
-            if self.in_speech and now - self.last_voice_at >= WHISPER_RUNTIME.final_silence_seconds:
-                self._enqueue_buffer(now)
-            return
+        prep = self._prepare_realtime_audio(cleaned)
+        chunk_ms = int(len(prep.pcm) / self.config.bytes_per_second * 1000)
+        logger.info(
+            "modern_audio_ingest room=%s peer=%s utterance_id=%s chunk_ms=%s raw_rms=%s normalized_rms=%s gain_applied=%.2f clipped=%s vad_decision=%s noise_floor=%.1f silence_ratio=%.3f queue_size=%s source_language=%s target_language=%s",
+            self.room,
+            self.peer_id,
+            self.utterance_id,
+            chunk_ms,
+            prep.raw_rms,
+            prep.normalized_rms,
+            prep.gain_applied,
+            prep.clipped,
+            prep.vad_decision,
+            prep.noise_floor,
+            prep.silence_ratio,
+            1 if self.final_task and not self.final_task.done() else 0,
+            self.config.source_language,
+            self.config.target_language,
+        )
 
-        if chunk_stats.rms >= VAD_RMS_THRESHOLD and (1.0 - chunk_stats.silence_ratio) >= STT_MIN_ACTIVE_RATIO:
-            self.audio_buffer.extend(chunk)
+        if prep.vad_decision:
+            if not self.in_speech:
+                self.utterance_id += 1
+                self.generation += 1
+                self.utterance_started_at = now
+                self.last_partial_at = 0.0
+                self.last_partial_text = ""
             self.in_speech = True
             self.last_voice_at = now
+            self.audio_buffer.extend(prep.pcm)
             self._trim_buffer()
-            self._enqueue_ready_chunks(now)
+            self._maybe_start_partial(now)
+            if self._buffer_seconds() >= REALTIME_UTTERANCE_MAX_SECONDS:
+                self._start_final(now, reason="max_duration")
             return
 
-        if self.in_speech and now - self.last_voice_at >= WHISPER_RUNTIME.final_silence_seconds:
-            self._enqueue_buffer(now)
+        self._update_noise_floor(prep.raw_rms)
+        if self.in_speech and now - self.last_voice_at >= REALTIME_FINAL_SILENCE_SECONDS:
+            self._start_final(now, reason="silence")
 
     async def close(self) -> None:
         self.closed = True
         self.audio_buffer.clear()
-        self.chunk_queue.clear()
-        if self.processing_task is not None and not self.processing_task.done():
-            self.processing_task.cancel()
+        tasks = [task for task in (self.partial_task, self.final_task) if task is not None and not task.done()]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
             try:
-                await self.processing_task
+                await task
             except asyncio.CancelledError:
                 pass
 
-    def _enqueue_ready_chunks(self, now: float) -> None:
-        target_bytes = int(self.config.bytes_per_second * REALTIME_CHUNK_TARGET_SECONDS)
-        max_bytes = int(self.config.bytes_per_second * REALTIME_CHUNK_MAX_SECONDS)
-        min_bytes = int(self.config.bytes_per_second * REALTIME_CHUNK_MIN_SECONDS)
-        while len(self.audio_buffer) >= target_bytes:
-            take = min(max_bytes, len(self.audio_buffer))
-            if take < min_bytes:
-                return
-            pcm = bytes(self.audio_buffer[:take])
-            del self.audio_buffer[:take]
-            self._enqueue_chunk(pcm, now)
+    def _prepare_realtime_audio(self, pcm: bytes) -> RealtimeAudioPrep:
+        raw_rms = pcm_rms(pcm)
+        self._update_noise_floor(raw_rms)
+        vad_threshold = self._adaptive_vad_threshold()
+        gain = 1.0
+        if 0 < raw_rms < REALTIME_GAIN_TARGET_RMS:
+            gain = min(REALTIME_MAX_GAIN, REALTIME_GAIN_TARGET_RMS / max(raw_rms, 1))
+        normalized = apply_gain_to_pcm(pcm, gain)
+        normalized_rms = pcm_rms(normalized)
+        silence_ratio = pcm_silence_ratio(
+            normalized,
+            self.config.sample_rate,
+            self.config.channels,
+            threshold=max(STT_HARD_SILENCE_RMS, min(vad_threshold, 380)),
+        )
+        clipped = pcm_has_clipping(normalized)
+        active_ratio = 1.0 - silence_ratio
+        vad_decision = (
+            active_ratio >= max(0.035, STT_MIN_ACTIVE_RATIO * 0.55)
+            and normalized_rms >= max(70, self.noise_floor * 1.35)
+        ) or normalized_rms >= vad_threshold
+        return RealtimeAudioPrep(
+            pcm=normalized,
+            raw_rms=raw_rms,
+            normalized_rms=normalized_rms,
+            gain_applied=round(gain, 2),
+            clipped=clipped,
+            silence_ratio=silence_ratio,
+            vad_decision=vad_decision,
+            noise_floor=round(self.noise_floor, 1),
+            vad_threshold=vad_threshold,
+        )
 
-    def _enqueue_buffer(self, now: float) -> None:
-        min_bytes = int(self.config.bytes_per_second * REALTIME_CHUNK_MIN_SECONDS)
-        if len(self.audio_buffer) >= min_bytes:
-            self._enqueue_chunk(bytes(self.audio_buffer), now)
-        else:
+    def _update_noise_floor(self, rms: int) -> None:
+        if rms <= 0:
+            return
+        if rms < max(180, self.noise_floor * 1.7):
+            self.noise_floor = max(30.0, min(360.0, (self.noise_floor * 0.94) + (rms * 0.06)))
+
+    def _adaptive_vad_threshold(self) -> int:
+        return int(max(90, min(420, self.noise_floor * 2.1)))
+
+    def _buffer_seconds(self) -> float:
+        if self.config.bytes_per_second <= 0:
+            return 0.0
+        return len(self.audio_buffer) / self.config.bytes_per_second
+
+    def _maybe_start_partial(self, now: float) -> None:
+        utterance_seconds = self._buffer_seconds()
+        if utterance_seconds < REALTIME_PARTIAL_MIN_SECONDS:
+            return
+        if now - self.last_partial_at < REALTIME_PARTIAL_INTERVAL_SECONDS:
+            return
+        if self.partial_task is not None and not self.partial_task.done():
+            return
+        pcm = bytes(self.audio_buffer)
+        self.last_partial_at = now
+        self.partial_task = asyncio.create_task(
+            self._process_utterance(
+                pcm=pcm,
+                utterance_id=self.utterance_id,
+                generation=self.generation,
+                is_final=False,
+                queued_at=now,
+                reason="partial",
+            )
+        )
+
+    def _start_final(self, now: float, reason: str) -> None:
+        if not self.audio_buffer:
+            self.in_speech = False
+            return
+        utterance_seconds = self._buffer_seconds()
+        if utterance_seconds < REALTIME_UTTERANCE_MIN_SECONDS:
             logger.info(
-                "modern_audio_short_skip room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s",
+                "modern_utterance_short_skip room=%s peer=%s utterance_id=%s partial=%s final=%s utterance_ms=%s rms=%s silence_ratio=%.3f stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s reason=%s",
                 self.room,
                 self.peer_id,
-                len(self.audio_buffer) / self.config.bytes_per_second if self.config.bytes_per_second else 0,
+                self.utterance_id,
+                False,
+                True,
+                int(utterance_seconds * 1000),
                 pcm_rms(bytes(self.audio_buffer)),
                 pcm_silence_ratio(bytes(self.audio_buffer), self.config.sample_rate, self.config.channels),
-                len(self.chunk_queue),
+                0,
+                0,
+                0,
+                True,
+                self.config.source_language,
+                self.config.target_language,
+                reason,
             )
+            self.audio_buffer.clear()
+            self.in_speech = False
+            self.last_partial_text = ""
+            return
+        if self.final_task is not None and not self.final_task.done():
+            logger.info("modern_final_busy_drop room=%s peer=%s utterance_id=%s utterance_ms=%s", self.room, self.peer_id, self.utterance_id, int(utterance_seconds * 1000))
+            self.audio_buffer.clear()
+            self.in_speech = False
+            return
+        pcm = bytes(self.audio_buffer)
+        utterance_id = self.utterance_id
+        generation = self.generation
         self.audio_buffer.clear()
         self.in_speech = False
-
-    def _enqueue_chunk(self, pcm: bytes, now: float) -> None:
-        stats = pcm_audio_stats(pcm, self.config.sample_rate, self.config.channels)
-        if should_skip_audio_for_stt(stats):
-            logger.info(
-                "modern_vad_skip room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s",
-                self.room,
-                self.peer_id,
-                stats.duration_seconds,
-                stats.rms,
-                stats.silence_ratio,
-                len(self.chunk_queue),
-            )
-            return
-
-        chunk_hash = hashlib.sha1(pcm).hexdigest()
-        if chunk_hash == self.last_chunk_hash or any(item.chunk_hash == chunk_hash for item in self.chunk_queue):
-            logger.info(
-                "modern_duplicate_chunk_skip room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s",
-                self.room,
-                self.peer_id,
-                stats.duration_seconds,
-                stats.rms,
-                stats.silence_ratio,
-                len(self.chunk_queue),
-            )
-            return
-
-        while len(self.chunk_queue) >= REALTIME_MAX_QUEUE_SIZE:
-            dropped = self.chunk_queue.popleft()
-            logger.info(
-                "modern_queue_drop room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s",
-                self.room,
-                self.peer_id,
-                dropped.stats.duration_seconds,
-                dropped.stats.rms,
-                dropped.stats.silence_ratio,
-                len(self.chunk_queue),
-            )
-
-        self.chunk_queue.append(
-            AudioChunk(
+        self.last_partial_text = ""
+        self.final_task = asyncio.create_task(
+            self._process_utterance(
                 pcm=pcm,
-                created_at=now,
-                generation=self.generation,
-                stats=stats,
-                chunk_hash=chunk_hash,
+                utterance_id=utterance_id,
+                generation=generation,
+                is_final=True,
+                queued_at=now,
+                reason=reason,
             )
         )
-        logger.info(
-            "modern_chunk_queued room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
-            self.room,
-            self.peer_id,
-            int(stats.duration_seconds * 1000),
-            stats.rms,
-            stats.silence_ratio,
-            len(self.chunk_queue),
-            0,
-            0,
-            0,
-            False,
-            self.config.source_language,
-            self.config.target_language,
-        )
-        self._ensure_processor()
 
-    def _ensure_processor(self) -> None:
-        if self.processing_task is None or self.processing_task.done():
-            self.processing_task = asyncio.create_task(self._process_queue())
-
-    async def _process_queue(self) -> None:
-        while self.chunk_queue and not self.closed:
-            chunk = self.chunk_queue.popleft()
-            if time.monotonic() - chunk.created_at > REALTIME_RESULT_MAX_AGE_SECONDS:
-                logger.info(
-                    "modern_stale_chunk_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
-                    self.room,
-                    self.peer_id,
-                    int(chunk.stats.duration_seconds * 1000),
-                    chunk.stats.rms,
-                    chunk.stats.silence_ratio,
-                    len(self.chunk_queue),
-                    0,
-                    True,
-                    self.config.source_language,
-                    self.config.target_language,
-                )
-                continue
-            await self._process(chunk)
-
-    async def _process(self, chunk: AudioChunk) -> None:
+    async def _process_utterance(
+        self,
+        *,
+        pcm: bytes,
+        utterance_id: int,
+        generation: int,
+        is_final: bool,
+        queued_at: float,
+        reason: str,
+    ) -> None:
+        started = time.perf_counter()
+        stats = pcm_audio_stats(pcm, self.config.sample_rate, self.config.channels)
+        utterance_ms = int(stats.duration_seconds * 1000)
         try:
-            started = time.perf_counter()
+            if is_final and stats.duration_seconds < REALTIME_UTTERANCE_MIN_SECONDS:
+                return
+            if not is_final and stats.duration_seconds < REALTIME_PARTIAL_MIN_SECONDS:
+                return
+            timeout = REALTIME_STT_TIMEOUT_SECONDS if is_final else min(0.9, REALTIME_STT_TIMEOUT_SECONDS)
             try:
                 text = await asyncio.wait_for(
-                    transcribe_pcm(chunk.pcm, self.config),
-                    timeout=REALTIME_STT_TIMEOUT_SECONDS,
+                    transcribe_pcm_bytes(pcm, self.config, self.last_final_text),
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
                 stt_ms = int((time.perf_counter() - started) * 1000)
-                logger.info(
-                    "modern_stt_timeout_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
-                    self.room,
-                    self.peer_id,
-                    int(chunk.stats.duration_seconds * 1000),
-                    chunk.stats.rms,
-                    chunk.stats.silence_ratio,
-                    len(self.chunk_queue),
-                    stt_ms,
-                    0,
-                    stt_ms,
-                    True,
-                    self.config.source_language,
-                    self.config.target_language,
-                )
+                self._log_utterance_event("modern_stt_timeout_discard", utterance_id, is_final, stats, stt_ms, 0, stt_ms, True, reason)
                 return
             stt_ms = int((time.perf_counter() - started) * 1000)
-            if not text:
-                logger.info(
-                    "modern_stt_no_speech room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s",
-                    self.room,
-                    self.peer_id,
-                    int(chunk.stats.duration_seconds * 1000),
-                    chunk.stats.rms,
-                    chunk.stats.silence_ratio,
-                    len(self.chunk_queue),
-                    stt_ms,
-                    0,
-                    stt_ms,
-                    False,
-                    self.config.source_language,
-                    self.config.target_language,
-                )
+            if generation != self.generation and not is_final:
                 return
-            if chunk.generation != self.generation:
+            if not self._is_reliable_transcript(text, is_final=is_final):
+                self._log_utterance_event("modern_stt_unreliable_discard", utterance_id, is_final, stats, stt_ms, 0, stt_ms, True, reason, text)
                 return
-            now = time.monotonic()
-            if transcript_key(text) == self.last_caption_text and now - self.last_caption_at < STT_REPEAT_WINDOW_SECONDS:
-                logger.info(
-                    "modern_stt_repeat_filtered room=%s peer=%s duration=%.3f rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s stt_text=%r",
-                    self.room,
-                    self.peer_id,
-                    chunk.stats.duration_seconds,
-                    chunk.stats.rms,
-                    chunk.stats.silence_ratio,
-                    len(self.chunk_queue),
-                    stt_ms,
-                    text[:80],
-                )
+            key = transcript_key(text)
+            if key == self.last_caption_text and time.monotonic() - self.last_caption_at < STT_REPEAT_WINDOW_SECONDS:
+                self._log_utterance_event("modern_stt_repeat_filtered", utterance_id, is_final, stats, stt_ms, 0, stt_ms, True, reason, text)
                 return
-            self.last_caption_text = transcript_key(text)
-            self.last_caption_at = now
-            self.last_chunk_hash = chunk.chunk_hash
-            if time.monotonic() - chunk.created_at > REALTIME_RESULT_MAX_AGE_SECONDS:
+            if not is_final:
+                if key == self.last_partial_text:
+                    return
+                self.last_partial_text = key
+                self.last_caption_text = key
+                self.last_caption_at = time.monotonic()
                 total_ms = int((time.perf_counter() - started) * 1000)
-                logger.info(
-                    "modern_old_stt_result_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s stt_text=%r",
+                self._log_utterance_event("modern_partial_caption", utterance_id, False, stats, stt_ms, 0, total_ms, False, reason, text)
+                await manager.send(
+                    "translation",
                     self.room,
                     self.peer_id,
-                    int(chunk.stats.duration_seconds * 1000),
-                    chunk.stats.rms,
-                    chunk.stats.silence_ratio,
-                    len(self.chunk_queue),
-                    stt_ms,
-                    0,
-                    total_ms,
-                    True,
-                    self.config.source_language,
-                    self.config.target_language,
-                    text[:80],
+                    {
+                        "type": "caption",
+                        "text": text,
+                        "translation": "",
+                        "source_language": self.config.source_language,
+                        "target_language": self.config.target_language,
+                        "is_final": False,
+                        "utterance_id": utterance_id,
+                        "timing_ms": {"stt": stt_ms, "translation": 0, "tts": 0, "total": total_ms},
+                    },
                 )
                 return
 
+            if is_probably_incomplete_sentence(text):
+                self._log_utterance_event("modern_incomplete_final_discard", utterance_id, True, stats, stt_ms, 0, stt_ms, True, reason, text)
+                return
             translate_started = time.perf_counter()
             translated = await translate_text_fast(text, self.config.source_language, self.config.target_language)
             translate_ms = int((time.perf_counter() - translate_started) * 1000)
             total_ms = int((time.perf_counter() - started) * 1000)
-            if not translated or total_ms > int(REALTIME_RESULT_MAX_AGE_SECONDS * 1000):
-                logger.info(
-                    "modern_translation_discard room=%s peer=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s stt_text=%r",
-                    self.room,
-                    self.peer_id,
-                    int(chunk.stats.duration_seconds * 1000),
-                    chunk.stats.rms,
-                    chunk.stats.silence_ratio,
-                    len(self.chunk_queue),
-                    stt_ms,
-                    translate_ms,
-                    total_ms,
-                    total_ms > int(REALTIME_RESULT_MAX_AGE_SECONDS * 1000),
-                    self.config.source_language,
-                    self.config.target_language,
-                    text[:80],
-                )
+            if not translated or total_ms > 1200:
+                self._log_utterance_event("modern_final_discard", utterance_id, True, stats, stt_ms, translate_ms, total_ms, True, reason, text)
                 return
-            logger.info(
-                "modern_caption room=%s peer=%s final=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s tts_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s text_len=%s translated_len=%s stt_text=%r",
+            self.last_caption_text = key
+            self.last_caption_at = time.monotonic()
+            self.last_final_text = clean_transcript(f"{self.last_final_text} {text}")[-500:]
+            self._log_utterance_event("modern_caption", utterance_id, True, stats, stt_ms, translate_ms, total_ms, False, reason, text)
+            await manager.send(
+                "translation",
                 self.room,
                 self.peer_id,
-                True,
-                int(chunk.stats.duration_seconds * 1000),
-                chunk.stats.rms,
-                chunk.stats.silence_ratio,
-                len(self.chunk_queue),
-                stt_ms,
-                translate_ms,
-                0,
-                total_ms,
-                False,
-                self.config.source_language,
-                self.config.target_language,
-                len(text),
-                len(translated),
-                text[:80],
-            )
-            payload = {
-                "type": "caption",
-                "text": text,
-                "translation": translated,
-                "source_language": self.config.source_language,
-                "target_language": self.config.target_language,
-                "is_final": True,
-                "timing_ms": {
-                    "stt": stt_ms,
-                    "translation": translate_ms,
-                    "tts": 0,
-                    "total": total_ms,
+                {
+                    "type": "caption",
+                    "text": text,
+                    "translation": translated,
+                    "source_language": self.config.source_language,
+                    "target_language": self.config.target_language,
+                    "is_final": True,
+                    "utterance_id": utterance_id,
+                    "timing_ms": {"stt": stt_ms, "translation": translate_ms, "tts": 0, "total": total_ms},
                 },
-            }
-            await manager.send("translation", self.room, self.peer_id, payload)
+            )
         except Exception as exc:
-            await manager.send("translation", self.room, self.peer_id, {"type": "error", "message": str(exc)})
+            logger.exception("modern_utterance_error room=%s peer=%s utterance_id=%s", self.room, self.peer_id, utterance_id)
+            if not self.closed:
+                await manager.send("translation", self.room, self.peer_id, {"type": "error", "message": str(exc)})
+
+    def _is_reliable_transcript(self, text: str, *, is_final: bool) -> bool:
+        cleaned = clean_transcript(text)
+        if is_low_value_transcript(cleaned):
+            return False
+        key = transcript_key(cleaned)
+        words = key.split()
+        if not words:
+            return False
+        if cleaned.lower().strip(" .!?") in {"pures", "neyiz", "niye kafayi", "niye kafay?", "ne kadar bicim", "ne kadar bi?im"}:
+            return False
+        if is_final and len(words) == 1 and len(key) < 6:
+            return False
+        if is_final and len(words) <= 2 and len(key) < 10:
+            return False
+        if has_repeated_short_words(cleaned):
+            return False
+        return True
+
+    def _log_utterance_event(
+        self,
+        event: str,
+        utterance_id: int,
+        is_final: bool,
+        stats: AudioStats,
+        stt_ms: int,
+        translate_ms: int,
+        total_ms: int,
+        discarded_old_chunk: bool,
+        reason: str,
+        stt_text: str = "",
+    ) -> None:
+        logger.info(
+            "%s room=%s peer=%s utterance_id=%s partial=%s final=%s utterance_ms=%s chunk_ms=%s rms=%s silence_ratio=%.3f queue_size=%s stt_ms=%s translate_ms=%s total_ms=%s discarded_old_chunk=%s source_language=%s target_language=%s reason=%s stt_text=%r",
+            event,
+            self.room,
+            self.peer_id,
+            utterance_id,
+            not is_final,
+            is_final,
+            int(stats.duration_seconds * 1000),
+            int(stats.duration_seconds * 1000),
+            stats.rms,
+            stats.silence_ratio,
+            1 if self.final_task and not self.final_task.done() else 0,
+            stt_ms,
+            translate_ms,
+            total_ms,
+            discarded_old_chunk,
+            self.config.source_language,
+            self.config.target_language,
+            reason,
+            stt_text[:80],
+        )
 
     def _trim_buffer(self) -> None:
-        max_bytes = int(self.config.bytes_per_second * REALTIME_MAX_BUFFER_SECONDS)
+        max_bytes = int(self.config.bytes_per_second * REALTIME_UTTERANCE_MAX_SECONDS)
         if len(self.audio_buffer) > max_bytes:
             dropped_bytes = len(self.audio_buffer) - max_bytes
             del self.audio_buffer[: len(self.audio_buffer) - max_bytes]
             logger.info(
-                "modern_buffer_trim room=%s peer=%s dropped_duration=%.3f buffer_duration=%.3f queue_size=%s",
+                "modern_buffer_trim room=%s peer=%s utterance_id=%s dropped_ms=%s buffer_ms=%s source_language=%s target_language=%s",
                 self.room,
                 self.peer_id,
-                dropped_bytes / self.config.bytes_per_second,
-                len(self.audio_buffer) / self.config.bytes_per_second,
-                len(self.chunk_queue),
+                self.utterance_id,
+                int(dropped_bytes / self.config.bytes_per_second * 1000),
+                int(len(self.audio_buffer) / self.config.bytes_per_second * 1000),
+                self.config.source_language,
+                self.config.target_language,
             )
-
 
 def normalize_source_lang(lang: str) -> str:
     if not lang:
@@ -713,6 +763,35 @@ def is_low_value_transcript(text: str) -> bool:
     if re.fullmatch(r"(m\s*k|m\s*k\s*)+", normalized):
         return True
     return has_repeated_short_words(cleaned)
+
+
+def is_probably_incomplete_sentence(text: str) -> bool:
+    cleaned = clean_transcript(text)
+    if not cleaned:
+        return True
+    key = transcript_key(cleaned)
+    words = key.split()
+    if len(words) <= 1:
+        return True
+    if cleaned.endswith(("...", "…")):
+        return True
+    dangling = {
+        "ve",
+        "ama",
+        "fakat",
+        "çünkü",
+        "cunku",
+        "için",
+        "icin",
+        "ile",
+        "to",
+        "and",
+        "but",
+        "because",
+        "for",
+        "of",
+    }
+    return words[-1] in dangling
 
 
 def transcription_prompt(source_lang: str, previous_text: str = "") -> str:
@@ -948,6 +1027,16 @@ def pcm_rms(pcm: bytes) -> int:
     if not samples:
         return 0
     return int(math.sqrt(sum(sample * sample for sample in samples) / len(samples)))
+
+
+def pcm_has_clipping(pcm: bytes) -> bool:
+    if len(pcm) < SAMPLE_WIDTH_BYTES:
+        return False
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    if not samples:
+        return False
+    clipped = sum(1 for sample in samples if abs(sample) >= 32000)
+    return clipped / len(samples) > 0.01
 
 
 def wav_rms(path: str) -> int:
@@ -1349,7 +1438,6 @@ async def root() -> JSONResponse:
             "service": "bridgecall-backend",
             "routes": [
                 "/signal",
-                "/translate",
                 "/ws/signaling/{room}/{peer_id}",
                 "/ws/translate/{room}/{peer_id}",
                 "/health",
@@ -1621,211 +1709,17 @@ async def leave_legacy_room(websocket: WebSocket) -> None:
 @app.websocket("/translate")
 async def legacy_translate_socket(websocket: WebSocket) -> None:
     await websocket.accept()
-    previous_text = ""
-    previous_sent_text = ""
-    previous_sent_at = 0.0
+    logger.info("legacy_translate_disabled client=%s", websocket.client.host if websocket.client else "unknown")
+    await safe_send(
+        websocket,
+        {
+            "error": "legacy_translate_disabled",
+            "message": "Use /ws/translate/{room}/{peer_id} with binary pcm16 audio.",
+        },
+    )
     try:
-        while True:
-            request_started = time.perf_counter()
-            raw = await websocket.receive_text()
-            data = json.loads(raw)
-            if data.get("type") == "ping":
-                await safe_send(websocket, {"type": "pong"})
-                continue
-            audio_b64 = data.get("audio")
-            source_lang = normalize_source_lang(data.get("sourceLang", "TR"))
-            target_lang = normalize_target_lang(data.get("targetLang", "RU"))
-            client_previous_text = clean_transcript(data.get("previousText", ""))
-
-            if not audio_b64:
-                await safe_send(websocket, {"error": "audio alani bos"})
-                continue
-
-            try:
-                decode_started = time.perf_counter()
-                audio_bytes = base64.b64decode(audio_b64)
-                decode_ms = int((time.perf_counter() - decode_started) * 1000)
-                if len(audio_bytes) < 12000:
-                    logger.info(
-                        "legacy_audio_too_small bytes=%s source=%s target=%s",
-                        len(audio_bytes),
-                        source_lang,
-                        target_lang,
-                    )
-                    await safe_send(
-                        websocket,
-                        {
-                            "noSpeech": True,
-                            "audioBytes": len(audio_bytes),
-                            "format": "pcm16wav",
-                            "sampleRate": 16000,
-                            "timingMs": {"decode": decode_ms, "total": int((time.perf_counter() - request_started) * 1000)},
-                        },
-                    )
-                    continue
-                temp_write_started = time.perf_counter()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as file:
-                    file.write(audio_bytes)
-                    temp_path = file.name
-                temp_write_ms = int((time.perf_counter() - temp_write_started) * 1000)
-                audio_stats = wav_audio_stats(temp_path)
-                if should_skip_audio_for_stt(audio_stats):
-                    total_ms = int((time.perf_counter() - request_started) * 1000)
-                    logger.info(
-                        "legacy_vad_skip bytes=%s source=%s target=%s duration=%.3f rms=%s silence_ratio=%.3f total_ms=%s",
-                        len(audio_bytes),
-                        source_lang,
-                        target_lang,
-                        audio_stats.duration_seconds,
-                        audio_stats.rms,
-                        audio_stats.silence_ratio,
-                        total_ms,
-                    )
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-                    await safe_send(
-                        websocket,
-                        {
-                            "noSpeech": True,
-                            "audioBytes": len(audio_bytes),
-                            "format": "pcm16wav",
-                            "sampleRate": 16000,
-                            "timingMs": {
-                                "decode": decode_ms,
-                                "tempWrite": temp_write_ms,
-                                "stt": 0,
-                                "tts": 0,
-                                "total": total_ms,
-                            },
-                        },
-                    )
-                    continue
-                try:
-                    stt_started = time.perf_counter()
-                    text = await transcribe_wav(temp_path, source_lang, previous_text or client_previous_text)
-                    stt_ms = int((time.perf_counter() - stt_started) * 1000)
-                finally:
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-                if not text:
-                    total_ms = int((time.perf_counter() - request_started) * 1000)
-                    logger.info(
-                        "legacy_stt_no_speech bytes=%s source=%s target=%s duration=%.3f rms=%s silence_ratio=%.3f stt_ms=%s total_ms=%s stt_text=%r",
-                        len(audio_bytes),
-                        source_lang,
-                        target_lang,
-                        audio_stats.duration_seconds,
-                        audio_stats.rms,
-                        audio_stats.silence_ratio,
-                        stt_ms,
-                        total_ms,
-                        text[:80],
-                    )
-                    await safe_send(
-                        websocket,
-                        {
-                            "noSpeech": True,
-                            "audioBytes": len(audio_bytes),
-                            "format": "pcm16wav",
-                            "sampleRate": 16000,
-                            "timingMs": {
-                                "decode": decode_ms,
-                                "tempWrite": temp_write_ms,
-                                "stt": stt_ms,
-                                "tts": 0,
-                                "total": total_ms,
-                            },
-                        },
-                    )
-                    continue
-                now = time.monotonic()
-                if (
-                    transcript_key(text) == previous_sent_text
-                    and now - previous_sent_at < STT_REPEAT_WINDOW_SECONDS
-                ):
-                    total_ms = int((time.perf_counter() - request_started) * 1000)
-                    logger.info(
-                        "legacy_stt_repeat_filtered bytes=%s source=%s target=%s duration=%.3f rms=%s silence_ratio=%.3f stt_ms=%s total_ms=%s stt_text=%r",
-                        len(audio_bytes),
-                        source_lang,
-                        target_lang,
-                        audio_stats.duration_seconds,
-                        audio_stats.rms,
-                        audio_stats.silence_ratio,
-                        stt_ms,
-                        total_ms,
-                        text[:80],
-                    )
-                    await safe_send(
-                        websocket,
-                        {
-                            "noSpeech": True,
-                            "audioBytes": len(audio_bytes),
-                            "format": "pcm16wav",
-                            "sampleRate": 16000,
-                            "timingMs": {
-                                "decode": decode_ms,
-                                "tempWrite": temp_write_ms,
-                                "stt": stt_ms,
-                                "tts": 0,
-                                "total": total_ms,
-                            },
-                        },
-                    )
-                    continue
-                translate_started = time.perf_counter()
-                translated = translate_text_value(text, source_lang, target_lang)
-                translate_ms = int((time.perf_counter() - translate_started) * 1000)
-                total_ms = int((time.perf_counter() - request_started) * 1000)
-                previous_text = clean_transcript(f"{previous_text} {text}")[-500:]
-                previous_sent_text = transcript_key(text)
-                previous_sent_at = time.monotonic()
-                logger.info(
-                    "legacy_caption bytes=%s source=%s target=%s duration=%.3f rms=%s silence_ratio=%.3f temp_write_ms=%s stt_ms=%s translate_ms=%s tts_ms=%s total_ms=%s text_len=%s translated_len=%s stt_text=%r",
-                    len(audio_bytes),
-                    source_lang,
-                    target_lang,
-                    audio_stats.duration_seconds,
-                    audio_stats.rms,
-                    audio_stats.silence_ratio,
-                    temp_write_ms,
-                    stt_ms,
-                    translate_ms,
-                    0,
-                    total_ms,
-                    len(text),
-                    len(translated),
-                    text[:80],
-                )
-                await safe_send(
-                    websocket,
-                    {
-                        "stage": "final",
-                        "original": text,
-                        "translated": translated,
-                        "sourceLang": source_lang,
-                        "targetLang": target_lang,
-                        "audioBytes": len(audio_bytes),
-                        "format": "pcm16wav",
-                        "sampleRate": 16000,
-                        "timingMs": {
-                            "decode": decode_ms,
-                            "tempWrite": temp_write_ms,
-                            "stt": stt_ms,
-                            "translation": translate_ms,
-                            "tts": 0,
-                            "total": total_ms,
-                        },
-                    },
-                )
-            except Exception as exc:
-                logger.exception("legacy_translate_error")
-                await safe_send(websocket, {"error": str(exc)})
-    except WebSocketDisconnect:
+        await websocket.close(code=1008)
+    except Exception:
         pass
 
 
