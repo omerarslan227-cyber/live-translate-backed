@@ -577,9 +577,14 @@ class AudioTranslationSession:
             translated = await translate_text_fast(text, self.config.source_language, self.config.target_language)
             translate_ms = int((time.perf_counter() - translate_started) * 1000)
             total_ms = int((time.perf_counter() - started) * 1000)
-            if not translated or total_ms > 1200:
-                self._log_utterance_event("modern_final_discard", utterance_id, True, stats, stt_ms, translate_ms, total_ms, True, reason, text)
+
+            # FIX: Don't discard successful translations due to timeout
+            if not translated:
+                self._log_utterance_event("modern_translation_failed", utterance_id, True, stats, stt_ms, translate_ms, total_ms, True, reason, text)
                 return
+
+            if total_ms > 2000:
+                logger.warning("slow_translation_sent room=%s peer=%s total_ms=%s", self.room, self.peer_id, total_ms)
             self.last_caption_text = key
             self.last_caption_at = time.monotonic()
             self.last_final_text = clean_transcript(f"{self.last_final_text} {text}")[-500:]
@@ -675,23 +680,48 @@ class AudioTranslationSession:
             )
 
 def normalize_source_lang(lang: str) -> str:
+    """Normalize kaynak dili DeepL ve Whisper için"""
     if not lang:
         return "TR"
-    lang = lang.upper()
-    if lang == "AUTO":
-        return "AUTO"
-    if lang == "EN-US":
-        return "EN"
-    return lang
+
+    lang = str(lang).upper().replace("_", "-")
+
+    VALID_SOURCE_LANGS = {
+        "AUTO": "AUTO",
+        "EN": "EN", "EN-US": "EN", "EN-GB": "EN",
+        "TR": "TR", "TR-TR": "TR",
+        "DE": "DE", "NL": "NL", "FR": "FR", "ES": "ES",
+        "RU": "RU", "UK": "UK", "ZH": "ZH", "KA": "KA", "AR": "AR",
+        "IT": "IT", "PL": "PL", "JA": "JA", "KO": "KO",
+        "PT": "PT", "PT-BR": "PT", "PT-PT": "PT",
+        "CS": "CS", "SV": "SV", "DA": "DA", "FI": "FI",
+        "EL": "EL", "HU": "HU", "NO": "NO", "RO": "RO",
+        "SK": "SK", "SL": "SL",
+    }
+
+    return VALID_SOURCE_LANGS.get(lang, "TR")
 
 
 def normalize_target_lang(lang: str) -> str:
+    """Normalize hedef dili DeepL için"""
     if not lang:
         return "EN-US"
-    lang = lang.upper()
-    if lang == "EN":
-        return "EN-US"
-    return lang
+
+    lang = str(lang).upper().replace("_", "-")
+
+    VALID_TARGET_LANGS = {
+        "EN": "EN-US", "EN-US": "EN-US", "EN-GB": "EN-GB",
+        "DE": "DE", "NL": "NL", "FR": "FR", "ES": "ES",
+        "RU": "RU", "UK": "UK", "ZH": "ZH", "KA": "KA", "AR": "AR",
+        "IT": "IT", "PL": "PL", "JA": "JA", "KO": "KO",
+        "PT": "PT-BR", "PT-BR": "PT-BR", "PT-PT": "PT-PT",
+        "TR": "TR",
+        "CS": "CS", "SV": "SV", "DA": "DA", "FI": "FI",
+        "EL": "EL", "HU": "HU", "NO": "NO", "RO": "RO",
+        "SK": "SK", "SL": "SL",
+    }
+
+    return VALID_TARGET_LANGS.get(lang, "EN-US")
 
 
 def whisper_lang(lang: str) -> str:
@@ -714,20 +744,20 @@ def whisper_lang(lang: str) -> str:
 
 
 def google_lang(lang: str) -> str:
-    mapping = {
+    target = normalize_target_lang(lang)
+    GOOGLE_LANGS = {
+        "EN-US": "en", "EN-GB": "en",
+        "DE": "de", "NL": "nl", "FR": "fr", "ES": "es",
+        "RU": "ru", "UK": "uk", "ZH": "zh-CN",
+        "KA": "ka", "AR": "ar", "IT": "it", "PL": "pl",
+        "JA": "ja", "KO": "ko",
+        "PT-BR": "pt", "PT-PT": "pt",
         "TR": "tr",
-        "RU": "ru",
-        "UK": "uk",
-        "EN-US": "en",
-        "EN": "en",
-        "DE": "de",
-        "NL": "nl",
-        "AR": "ar",
-        "ES": "es",
-        "ZH": "zh-CN",
-        "KA": "ka",
+        "CS": "cs", "SV": "sv", "DA": "da", "FI": "fi",
+        "EL": "el", "HU": "hu", "NO": "no", "RO": "ro",
+        "SK": "sk", "SL": "sl",
     }
-    return mapping.get(normalize_target_lang(lang), "en")
+    return GOOGLE_LANGS.get(target, "en")
 
 
 def clean_transcript(text: str) -> str:
@@ -1529,8 +1559,20 @@ async def modern_translation_socket(websocket: WebSocket, room: str, peer_id: st
             chunk = message.get("bytes")
             if chunk:
                 await session.add_audio(chunk)
-    except (WebSocketDisconnect, RuntimeError):
-        pass
+    except WebSocketDisconnect:
+        logger.info("translate_client_disconnect room=%s peer=%s", room, peer_id)
+        pending = [t for t in [session.partial_task, session.final_task] if t and not t.done()]
+        if pending:
+            try:
+                done, remaining = await asyncio.wait(pending, timeout=2.0)
+                for task in remaining:
+                    task.cancel()
+            except Exception as e:
+                logger.warning("error_waiting_pending_tasks room=%s peer=%s", room, peer_id)
+    except RuntimeError as e:
+        logger.error("translate_runtime_error room=%s peer=%s error=%s", room, peer_id, e)
+    except Exception as e:
+        logger.exception("translate_unexpected_error room=%s peer=%s", room, peer_id)
     finally:
         await session.close()
         await manager.disconnect("translation", room, peer_id)
