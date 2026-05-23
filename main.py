@@ -1232,7 +1232,6 @@ async def transcribe_pcm_bytes(pcm: bytes, config: TranslationConfig, previous_t
             }
             if groq_lang != "auto":
                 data["language"] = groq_lang
-                data["language_identification"] = True
 
             response = await client.post(
                 GROQ_STT_URL,
@@ -1320,7 +1319,6 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             }
             if groq_lang != "auto":
                 data["language"] = groq_lang
-                data["language_identification"] = True
             data["prompt"] = transcription_prompt(source_lang, previous_text)
 
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
