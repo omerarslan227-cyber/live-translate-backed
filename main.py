@@ -17,12 +17,12 @@ from typing import Any
 from uuid import uuid4
 
 import deepl
-import httpx
 import uvicorn
 from deep_translator import GoogleTranslator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from faster_whisper import WhisperModel
 
 try:
     import redis.asyncio as redis
@@ -44,10 +44,8 @@ app.add_middleware(
 PORT = int(os.getenv("PORT", "8000"))
 DEEPL_AUTH_KEY = os.getenv("DEEPL_API_KEY") or os.getenv("DEEPL_AUTH_KEY", "")
 DEEPL_API_URL = os.getenv("DEEPL_API_URL", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
-GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE") or os.getenv("WHISPER_MODEL", "small")
+WHISPER_MODEL_SIZE = "base"
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -93,6 +91,11 @@ JOIN_COOLDOWN_SECONDS = int(os.getenv("JOIN_COOLDOWN_SECONDS", "60"))
 ROOM_CODE_RE = re.compile(rf"^[A-Za-z0-9]{{{ROOM_CODE_LENGTH},}}$")
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
+WHISPER_MODEL = WhisperModel(
+    "base",
+    device=WHISPER_DEVICE,
+    compute_type=WHISPER_COMPUTE_TYPE,
+)
 
 
 @dataclass(frozen=True)
@@ -164,20 +167,6 @@ TRANSCRIPTION_PROMPTS = {
     "zh": "Transcribe this speech naturally and accurately in the selected source language.",
     "ka": "Transcribe this speech naturally and accurately in the selected source language.",
 }
-
-GROQ_LANGUAGE_MAP = {
-    "tr": "tr",
-    "en": "en",
-    "ru": "ru",
-    "de": "de",
-    "nl": "nl",
-    "uk": "uk",
-    "ar": "ar",
-    "es": "es",
-    "zh": "zh",
-    "ka": "ka",
-}
-
 
 @dataclass
 class TranslationConfig:
@@ -1176,22 +1165,38 @@ def normalize_pcm_for_stt(pcm: bytes, sample_rate: int, channels: int) -> tuple[
     return apply_gain_to_pcm(prepared_pcm, gain), original_rms, round(gain, 2), trimmed_ms
 
 
+def transcribe_with_whisper(path: str, source_lang: str, previous_text: str = "") -> str:
+    segments, _info = WHISPER_MODEL.transcribe(
+        path,
+        language="tr",
+        temperature=0.0,
+        beam_size=5,
+        vad_filter=WHISPER_VAD_FILTER,
+        vad_parameters={
+            "min_silence_duration_ms": STT_VAD_MIN_SILENCE_MS,
+            "speech_pad_ms": STT_VAD_SPEECH_PAD_MS,
+        },
+        initial_prompt=transcription_prompt(source_lang, previous_text),
+        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+        log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+    )
+    text, _confidence = stable_segment_text(segments)
+    return text
+
+
 async def transcribe_pcm(pcm: bytes, config: TranslationConfig) -> str:
     return await transcribe_pcm_bytes(pcm, config)
 
 
 async def transcribe_pcm_bytes(pcm: bytes, config: TranslationConfig, previous_text: str = "") -> str:
-    if not GROQ_API_KEY:
-        logger.error("GROQ_API_KEY eksik!")
-        return ""
-
     source_lang = normalize_source_lang(config.source_language)
-    groq_lang = whisper_lang(source_lang)
+    stt_lang = whisper_lang(source_lang)
     original_stats = pcm_audio_stats(pcm, config.sample_rate, config.channels)
     if config.sample_rate != SAMPLE_RATE or config.channels != CHANNELS:
         logger.info(
-            "groq_stt_bad_format lang=%s sample_rate=%s channels=%s chunk_ms=%s rms=%s silence_ratio=%.3f",
-            groq_lang,
+            "whisper_stt_bad_format lang=%s sample_rate=%s channels=%s chunk_ms=%s rms=%s silence_ratio=%.3f",
+            stt_lang,
             config.sample_rate,
             config.channels,
             int(original_stats.duration_seconds * 1000),
@@ -1201,8 +1206,8 @@ async def transcribe_pcm_bytes(pcm: bytes, config: TranslationConfig, previous_t
         return ""
     if should_skip_audio_for_stt(original_stats):
         logger.info(
-            "groq_stt_vad_skip lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f",
-            groq_lang,
+            "whisper_stt_vad_skip lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f",
+            stt_lang,
             int(original_stats.duration_seconds * 1000),
             original_stats.rms,
             original_stats.silence_ratio,
@@ -1215,74 +1220,55 @@ async def transcribe_pcm_bytes(pcm: bytes, config: TranslationConfig, previous_t
         config.channels,
     )
     prepared_stats = pcm_audio_stats(prepared_pcm, config.sample_rate, config.channels)
+    stt_path = write_wav(prepared_pcm, config.sample_rate, config.channels)
     try:
-        async with httpx.AsyncClient(timeout=REALTIME_STT_TIMEOUT_SECONDS) as client:
-            files = {
-                "file": (
-                    "audio.wav",
-                    wav_bytes_from_pcm(prepared_pcm, config.sample_rate, config.channels),
-                    "audio/wav",
-                )
-            }
-            data = {
-                "model": GROQ_STT_MODEL,
-                "response_format": "json",
-                "temperature": "0",
-                "prompt": transcription_prompt(source_lang, previous_text),
-            }
-            if groq_lang != "auto":
-                data["language"] = groq_lang
-
-            response = await client.post(
-                GROQ_STT_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files=files,
-                data=data,
-            )
-            response.raise_for_status()
-            text = response.json().get("text", "").strip()
-            if is_low_value_transcript(text):
-                logger.info(
-                    "groq_stt_low_value lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f stt_text=%r",
-                    groq_lang,
-                    int(original_stats.duration_seconds * 1000),
-                    original_stats.rms,
-                    original_stats.silence_ratio,
-                    text[:80],
-                )
-                return ""
+        text = await asyncio.wait_for(
+            asyncio.to_thread(transcribe_with_whisper, stt_path, source_lang, previous_text),
+            timeout=REALTIME_STT_TIMEOUT_SECONDS,
+        )
+        if is_low_value_transcript(text):
             logger.info(
-                "groq_stt_ok lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f prepared_chunk_ms=%s prepared_rms=%s gain=%.2f trimmed_ms=%s stt_text=%r",
-                groq_lang,
+                "whisper_stt_low_value lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f stt_text=%r",
+                stt_lang,
                 int(original_stats.duration_seconds * 1000),
                 original_stats.rms,
                 original_stats.silence_ratio,
-                int(prepared_stats.duration_seconds * 1000),
-                prepared_stats.rms,
-                gain,
-                trimmed_ms,
                 text[:80],
             )
-            return text
-    except httpx.TimeoutException:
-        logger.warning("groq_stt_timeout lang=%s", groq_lang)
+            return ""
+        logger.info(
+            "whisper_stt_ok lang=%s chunk_ms=%s rms=%s silence_ratio=%.3f prepared_chunk_ms=%s prepared_rms=%s gain=%.2f trimmed_ms=%s stt_text=%r",
+            stt_lang,
+            int(original_stats.duration_seconds * 1000),
+            original_stats.rms,
+            original_stats.silence_ratio,
+            int(prepared_stats.duration_seconds * 1000),
+            prepared_stats.rms,
+            gain,
+            trimmed_ms,
+            text[:80],
+        )
+        return text
+    except asyncio.TimeoutError:
+        logger.warning("whisper_stt_timeout lang=%s", stt_lang)
         return ""
     except Exception as e:
-        logger.error("groq_stt_exception %s", e)
+        logger.error("whisper_stt_exception %s", e)
         return ""
+    finally:
+        try:
+            os.remove(stt_path)
+        except OSError:
+            pass
 
 
 async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -> str:
-    if not GROQ_API_KEY:
-        logger.error("GROQ_API_KEY eksik!")
-        return ""
-
-    groq_lang = GROQ_LANGUAGE_MAP.get(source_lang.lower(), source_lang.lower())
+    stt_lang = whisper_lang(source_lang)
     original_stats = wav_audio_stats(path)
     if original_stats.sample_rate != SAMPLE_RATE or original_stats.channels != CHANNELS:
         logger.info(
-            "groq_stt_bad_format lang=%s sample_rate=%s channels=%s duration=%.3f rms=%s silence_ratio=%.3f",
-            groq_lang,
+            "whisper_stt_bad_format lang=%s sample_rate=%s channels=%s duration=%.3f rms=%s silence_ratio=%.3f",
+            stt_lang,
             original_stats.sample_rate,
             original_stats.channels,
             original_stats.duration_seconds,
@@ -1292,8 +1278,8 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
         return ""
     if should_skip_audio_for_stt(original_stats):
         logger.info(
-            "groq_stt_vad_skip lang=%s duration=%.3f rms=%s silence_ratio=%.3f",
-            groq_lang,
+            "whisper_stt_vad_skip lang=%s duration=%.3f rms=%s silence_ratio=%.3f",
+            stt_lang,
             original_stats.duration_seconds,
             original_stats.rms,
             original_stats.silence_ratio,
@@ -1304,64 +1290,43 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
     try:
         stt_path, original_rms, gain, trimmed_ms = normalize_wav_for_stt(path)
         prepared_stats = wav_audio_stats(stt_path)
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            with open(stt_path, "rb") as f:
-                audio_data = f.read()
+        if os.path.getsize(stt_path) < 8000:
+            return ""
 
-            if len(audio_data) < 8000:
-                return ""
-
-            files = {"file": ("audio.wav", audio_data, "audio/wav")}
-            data = {
-                "model": GROQ_STT_MODEL,
-                "response_format": "json",
-                "temperature": "0",
-            }
-            if groq_lang != "auto":
-                data["language"] = groq_lang
-            data["prompt"] = transcription_prompt(source_lang, previous_text)
-
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-
-            response = await client.post(
-                GROQ_STT_URL,
-                headers=headers,
-                files=files,
-                data=data,
-            )
-            response.raise_for_status()
-
-            text = response.json().get("text", "").strip()
-            if is_low_value_transcript(text):
-                logger.info(
-                    "groq_stt_low_value lang=%s duration=%.3f rms=%s silence_ratio=%.3f stt_text=%r",
-                    groq_lang,
-                    original_stats.duration_seconds,
-                    original_stats.rms,
-                    original_stats.silence_ratio,
-                    text[:80],
-                )
-                return ""
-
+        text = await asyncio.wait_for(
+            asyncio.to_thread(transcribe_with_whisper, stt_path, source_lang, previous_text),
+            timeout=10.0,
+        )
+        if is_low_value_transcript(text):
             logger.info(
-                "groq_stt_ok lang=%s duration=%.3f rms=%s silence_ratio=%.3f prepared_duration=%.3f prepared_rms=%s gain=%.2f trimmed_ms=%s stt_text=%r",
-                groq_lang,
+                "whisper_stt_low_value lang=%s duration=%.3f rms=%s silence_ratio=%.3f stt_text=%r",
+                stt_lang,
                 original_stats.duration_seconds,
                 original_stats.rms,
                 original_stats.silence_ratio,
-                prepared_stats.duration_seconds,
-                prepared_stats.rms,
-                gain,
-                trimmed_ms,
                 text[:80],
             )
-            return text
+            return ""
 
-    except httpx.TimeoutException:
-        logger.warning("groq_stt_timeout lang=%s", groq_lang)
+        logger.info(
+            "whisper_stt_ok lang=%s duration=%.3f rms=%s silence_ratio=%.3f prepared_duration=%.3f prepared_rms=%s gain=%.2f trimmed_ms=%s stt_text=%r",
+            stt_lang,
+            original_stats.duration_seconds,
+            original_stats.rms,
+            original_stats.silence_ratio,
+            prepared_stats.duration_seconds,
+            prepared_stats.rms,
+            gain,
+            trimmed_ms,
+            text[:80],
+        )
+        return text
+
+    except asyncio.TimeoutError:
+        logger.warning("whisper_stt_timeout lang=%s", stt_lang)
         return ""
     except Exception as e:
-        logger.error("groq_stt_exception %s", e)
+        logger.error("whisper_stt_exception %s", e)
         return ""
     finally:
         if stt_path != path:
