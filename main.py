@@ -13,11 +13,10 @@ import time
 import wave
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 import deepl
-import httpx
 import numpy as np
 import uvicorn
 from deep_translator import GoogleTranslator
@@ -25,6 +24,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
+from groq import Groq
 
 try:
     import redis.asyncio as redis
@@ -101,6 +101,7 @@ WHISPER_MODEL = WhisperModel(
     device=WHISPER_DEVICE,
     compute_type=WHISPER_COMPUTE_TYPE,
 )
+GROQ_CLIENT = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
 @dataclass(frozen=True)
@@ -1100,17 +1101,17 @@ def apply_gain_to_pcm(pcm: bytes, gain: float) -> bytes:
     return struct.pack(f"<{len(amplified)}h", *amplified)
 
 
-def prepare_audio_properly(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
+def prepare_audio_properly(audio_bytes: bytes, sample_rate: int = 16000) -> bytes:
     try:
-        if not pcm:
+        if not audio_bytes:
             logger.warning("prepare_audio_empty_input")
-            return pcm
-        if len(pcm) % SAMPLE_WIDTH_BYTES:
-            pcm = pcm[: -(len(pcm) % SAMPLE_WIDTH_BYTES)]
+            return audio_bytes
+        if len(audio_bytes) % SAMPLE_WIDTH_BYTES:
+            audio_bytes = audio_bytes[: -(len(audio_bytes) % SAMPLE_WIDTH_BYTES)]
 
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
         if audio.size == 0:
-            return pcm
+            return audio_bytes
 
         audio = audio / 32768.0
         audio = audio - float(np.mean(audio))
@@ -1122,7 +1123,7 @@ def prepare_audio_properly(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
         return audio.tobytes()
     except Exception as e:
         logger.error("audio_preprocessing_error %s", e)
-        return pcm
+        return audio_bytes
 
 
 def trim_pcm_for_stt(pcm: bytes, sample_rate: int, channels: int, original_rms: int) -> tuple[bytes, int]:
@@ -1178,13 +1179,9 @@ def normalize_wav_for_stt(path: str) -> tuple[str, int, float, int]:
         return path, original_rms, 1.0, 0
 
     prepared_pcm, trimmed_ms = trim_pcm_for_stt(pcm, sample_rate, channels, original_rms)
-    prepared_rms = pcm_rms(prepared_pcm)
-    normalized_pcm = prepare_audio_properly(prepared_pcm, sample_rate)
-    normalized_rms = pcm_rms(normalized_pcm)
-    gain = normalized_rms / max(prepared_rms, 1)
-    if normalized_pcm == pcm and trimmed_ms == 0:
-        return path, original_rms, round(gain, 2), 0
-    return write_wav(normalized_pcm, sample_rate, channels), original_rms, round(gain, 2), trimmed_ms
+    if trimmed_ms > 0:
+        return write_wav(prepared_pcm, sample_rate, channels), original_rms, 1.0, trimmed_ms
+    return path, original_rms, 1.0, 0
 
 
 def write_wav(pcm: bytes, sample_rate: int, channels: int) -> str:
@@ -1214,120 +1211,188 @@ def normalize_pcm_for_stt(pcm: bytes, sample_rate: int, channels: int) -> tuple[
         return pcm, original_rms, 1.0, 0
 
     prepared_pcm, trimmed_ms = trim_pcm_for_stt(pcm, sample_rate, channels, original_rms)
-    prepared_rms = pcm_rms(prepared_pcm)
-    normalized_pcm = prepare_audio_properly(prepared_pcm, sample_rate)
-    gain = pcm_rms(normalized_pcm) / max(prepared_rms, 1)
-    return normalized_pcm, original_rms, round(gain, 2), trimmed_ms
-
-
-def transcribe_with_whisper(path: str, source_lang: str, previous_text: str = "") -> str:
-    stt_lang = whisper_lang(source_lang)
-    segments, _info = WHISPER_MODEL.transcribe(
-        path,
-        language=None if stt_lang == "auto" else stt_lang,
-        temperature=0.0,
-        beam_size=5,
-        best_of=1,
-        vad_filter=False,
-        vad_parameters={
-            "min_silence_duration_ms": STT_VAD_MIN_SILENCE_MS,
-            "speech_pad_ms": STT_VAD_SPEECH_PAD_MS,
-        },
-        initial_prompt=transcription_prompt(source_lang, previous_text),
-        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-        log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-    )
-    text, _confidence = stable_segment_text(segments)
-    return text
-
-
-async def transcribe_with_groq(
-    wav_bytes: bytes,
-    source_lang: str,
-    timeout_seconds: float,
-    previous_text: str = "",
-) -> str:
-    if not GROQ_API_KEY:
-        logger.warning("groq_stt_unavailable missing_api_key")
-        return ""
-
-    stt_lang = whisper_lang(source_lang)
-    files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
-    data = {
-        "model": GROQ_STT_MODEL,
-        "response_format": "json",
-        "temperature": "0",
-        "prompt": transcription_prompt(source_lang, previous_text),
-    }
-    if stt_lang != "auto":
-        data["language"] = stt_lang
-
-    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(
-            GROQ_STT_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files=files,
-            data=data,
-        )
-        response.raise_for_status()
-        return clean_transcript(response.json().get("text", ""))
+    return prepared_pcm, original_rms, 1.0, trimmed_ms
 
 
 async def transcribe_audio_hybrid(
-    prepared_pcm: bytes,
+    audio_bytes: bytes,
     source_lang: str,
-    sample_rate: int,
-    channels: int,
-    timeout_seconds: float,
-    previous_text: str = "",
-) -> str:
-    stt_lang = whisper_lang(source_lang)
-    stt_path = write_wav(prepared_pcm, sample_rate, channels)
-    try:
-        logger.info("stt_whisper_attempt lang=%s", stt_lang)
-        stt_text = await asyncio.wait_for(
-            asyncio.to_thread(transcribe_with_whisper, stt_path, source_lang, previous_text),
-            timeout=timeout_seconds,
-        )
-        if not is_low_value_transcript(stt_text):
-            logger.info("stt_whisper_success lang=%s text_len=%s", stt_lang, len(stt_text))
-            return stt_text
+    whisper_model,
+    groq_client,
+) -> Optional[str]:
+    logger.info("stt_whisper_attempt lang=%s", source_lang)
 
-        if stt_text:
-            logger.warning("stt_whisper_garbage lang=%s text=%r", stt_lang, stt_text[:80])
-        else:
-            logger.warning("stt_whisper_empty lang=%s", stt_lang)
-    except asyncio.TimeoutError:
-        logger.warning("stt_whisper_timeout lang=%s", stt_lang)
-    except Exception as e:
-        logger.error("stt_whisper_error %s", e)
-    finally:
-        try:
-            os.remove(stt_path)
-        except OSError:
-            pass
+    stt_text = await _transcribe_with_whisper(
+        audio_bytes,
+        source_lang,
+        whisper_model,
+    )
 
-    try:
-        logger.info("stt_groq_fallback lang=%s", stt_lang)
-        stt_text = await transcribe_with_groq(
-            wav_bytes_from_pcm(prepared_pcm, sample_rate, channels),
-            source_lang,
-            timeout_seconds,
-            previous_text,
-        )
-        if not is_low_value_transcript(stt_text):
-            logger.info("stt_groq_success_fallback lang=%s text_len=%s", stt_lang, len(stt_text))
-            return stt_text
-        if stt_text:
-            logger.warning("stt_groq_garbage lang=%s text=%r", stt_lang, stt_text[:80])
-    except httpx.TimeoutException:
-        logger.warning("stt_groq_timeout lang=%s", stt_lang)
-    except Exception as e:
-        logger.error("stt_groq_error %s", e)
+    if _is_valid_transcription(stt_text):
+        logger.info("stt_whisper_success lang=%s text_len=%s", source_lang, len(stt_text))
+        return stt_text
 
-    logger.error("stt_hybrid_complete_failure lang=%s", stt_lang)
+    if stt_text:
+        logger.warning("stt_whisper_garbage lang=%s text=%s", source_lang, stt_text[:50])
+    else:
+        logger.warning("stt_whisper_empty lang=%s", source_lang)
+
+    logger.info("stt_groq_fallback lang=%s", source_lang)
+
+    stt_text = await _transcribe_with_groq(
+        audio_bytes,
+        source_lang,
+        groq_client,
+    )
+
+    if _is_valid_transcription(stt_text):
+        logger.info("stt_groq_success_fallback lang=%s text_len=%s", source_lang, len(stt_text))
+        return stt_text
+
+    logger.error("stt_hybrid_complete_failure lang=%s", source_lang)
     return ""
+
+
+async def _transcribe_with_whisper(
+    audio_bytes: bytes,
+    source_lang: str,
+    whisper_model,
+) -> Optional[str]:
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        try:
+            segments, info = whisper_model.transcribe(
+                tmp_path,
+                language=_get_whisper_lang(source_lang),
+                temperature=0.0,
+                beam_size=5,
+                best_of=1,
+                vad_filter=False,
+            )
+
+            stt_text = " ".join([seg.text for seg in segments]).strip()
+            return stt_text if stt_text else None
+
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    except Exception as e:
+        logger.error("whisper_transcribe_error %s", e)
+        return None
+
+
+async def _transcribe_with_groq(
+    audio_bytes: bytes,
+    source_lang: str,
+    groq_client,
+) -> Optional[str]:
+    if groq_client is None:
+        logger.warning("groq_transcribe_unavailable missing_api_key")
+        return None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        try:
+            with open(tmp_path, "rb") as audio_file:
+                response = groq_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language=_get_groq_lang(source_lang),
+                    temperature=0.0,
+                )
+
+            stt_text = response.text.strip()
+            return stt_text if stt_text else None
+
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    except Exception as e:
+        logger.error("groq_transcribe_error %s", e)
+        return None
+
+
+def _is_valid_transcription(text: Optional[str]) -> bool:
+    if not text or len(text) < 2:
+        return False
+
+    if is_low_value_transcript(text):
+        return False
+
+    garbage_patterns = [
+        "altyazÄ± m.k.",
+        "the system is",
+        "subtitle",
+    ]
+
+    if text.lower() in garbage_patterns:
+        return False
+
+    for char in set(text):
+        if text.count(char) > 20:
+            return False
+
+    return True
+
+
+def _get_whisper_lang(lang: str) -> Optional[str]:
+    lang_map = {
+        "TR": "tr",
+        "EN": "en",
+        "DE": "de",
+        "FR": "fr",
+        "ES": "es",
+        "RU": "ru",
+        "UK": "uk",
+        "ZH": "zh",
+        "JA": "ja",
+        "KO": "ko",
+        "IT": "it",
+        "PT": "pt",
+        "PL": "pl",
+        "NL": "nl",
+        "AR": "ar",
+    }
+    normalized = normalize_source_lang(lang)
+    if normalized == "AUTO":
+        return None
+    return lang_map.get(normalized.upper(), "en")
+
+
+def _get_groq_lang(lang: str) -> Optional[str]:
+    lang_map = {
+        "TR": "tr",
+        "EN": "en",
+        "DE": "de",
+        "FR": "fr",
+        "ES": "es",
+        "RU": "ru",
+        "UK": "uk",
+        "ZH": "zh",
+        "JA": "ja",
+        "KO": "ko",
+        "IT": "it",
+        "PT": "pt",
+        "PL": "pl",
+        "NL": "nl",
+        "AR": "ar",
+    }
+    normalized = normalize_source_lang(lang)
+    if normalized == "AUTO":
+        return None
+    return lang_map.get(normalized.upper(), "en")
 
 
 async def transcribe_pcm(pcm: bytes, config: TranslationConfig) -> str:
@@ -1364,15 +1429,14 @@ async def transcribe_pcm_bytes(pcm: bytes, config: TranslationConfig, previous_t
         config.sample_rate,
         config.channels,
     )
+    prepared_pcm = prepare_audio_properly(prepared_pcm, config.sample_rate)
     prepared_stats = pcm_audio_stats(prepared_pcm, config.sample_rate, config.channels)
     try:
         text = await transcribe_audio_hybrid(
-            prepared_pcm,
-            source_lang,
-            config.sample_rate,
-            config.channels,
-            REALTIME_STT_TIMEOUT_SECONDS,
-            previous_text,
+            wav_bytes_from_pcm(prepared_pcm, config.sample_rate, config.channels),
+            source_lang=config.source_language,
+            whisper_model=WHISPER_MODEL,
+            groq_client=GROQ_CLIENT,
         )
         if is_low_value_transcript(text):
             logger.info(
@@ -1434,13 +1498,12 @@ async def transcribe_wav(path: str, source_lang: str, previous_text: str = "") -
             return ""
 
         prepared_pcm, prepared_sample_rate, prepared_channels = read_wav_pcm(stt_path)
+        prepared_pcm = prepare_audio_properly(prepared_pcm, prepared_sample_rate)
         text = await transcribe_audio_hybrid(
-            prepared_pcm,
-            source_lang,
-            prepared_sample_rate,
-            prepared_channels,
-            10.0,
-            previous_text,
+            wav_bytes_from_pcm(prepared_pcm, prepared_sample_rate, prepared_channels),
+            source_lang=source_lang,
+            whisper_model=WHISPER_MODEL,
+            groq_client=GROQ_CLIENT,
         )
         if is_low_value_transcript(text):
             logger.info(
