@@ -49,11 +49,11 @@ DEEPL_API_URL = os.getenv("DEEPL_API_URL", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-WHISPER_MODEL_SIZE = "base"
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_MODEL_SIZE = "small"
+WHISPER_DEVICE = "cuda"
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
 WHISPER_VAD_FILTER = False
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_COMPUTE_TYPE = "int8"
 WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.68"))
 WHISPER_LOG_PROB_THRESHOLD = float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-0.65"))
 WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.4"))
@@ -97,9 +97,9 @@ ROOM_CODE_RE = re.compile(rf"^[A-Za-z0-9]{{{ROOM_CODE_LENGTH},}}$")
 
 translator = deepl.Translator(DEEPL_AUTH_KEY, server_url=DEEPL_API_URL or None) if DEEPL_AUTH_KEY else None
 WHISPER_MODEL = WhisperModel(
-    "base",
-    device=WHISPER_DEVICE,
-    compute_type=WHISPER_COMPUTE_TYPE,
+    "small",
+    device="cuda",
+    compute_type="int8",
 )
 GROQ_CLIENT = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
